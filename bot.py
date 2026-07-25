@@ -5,7 +5,7 @@ Daily crypto 4H sentiment bot.
 - Pulls hourly prices + volume from CoinGecko's public API and buckets them into 4H closes
 - Computes % change, RSI(14), a 50-period trend confirmation, volume context, and support/resistance
 - Buckets that into a sentiment label
-- Fills in a plain-language message (no paid AI calls, fully free)
+- Fills in a plain-language message with bolded key values (no paid AI calls, fully free)
 - Posts the digest to a Telegram channel automatically
 
 Run manually with:  python bot.py
@@ -127,8 +127,8 @@ def support_resistance_note(closes, lookback=30):
     resistance = max(window)
     days = round(len(window) * BUCKET_HOURS / 24, 1)
     return (
-        f"Nearby support ~${format_price(support)}, resistance ~${format_price(resistance)} "
-        f"(last ~{days}d)."
+        f"Nearby <b>support ~${format_price(support)}</b>, "
+        f"<b>resistance ~${format_price(resistance)}</b> (last ~{days}d)."
     )
 
 
@@ -292,10 +292,18 @@ TREND_EMOJI = {
 
 def build_tweet(ticker, pct, rsi, t_bucket, r_bucket, trend_note=None, vol_note=None, sr_note=None):
     emoji = TREND_EMOJI.get(t_bucket, "")
+    pct_display = f"{abs(pct):.1f}" if pct >= 0 else f"{pct:.1f}"
     trend_line = random.choice(TREND_TEMPLATES[t_bucket]).format(
-        ticker=f"${ticker}", pct=f"{abs(pct):.1f}" if pct >= 0 else f"{pct:.1f}"
+        ticker=f"${ticker}", pct=pct_display
     )
-    rsi_line = random.choice(RSI_NOTES[r_bucket]).format(rsi=f"{rsi:.0f}" if rsi else "N/A")
+    trend_line = trend_line.replace(f"{pct_display}%", f"<b>{pct_display}%</b>", 1)
+
+    rsi_display = f"{rsi:.0f}" if rsi else "N/A"
+    rsi_line = random.choice(RSI_NOTES[r_bucket]).format(rsi=rsi_display)
+    if rsi_line:
+        rsi_line = rsi_line.replace(rsi_display, f"<b>{rsi_display}</b>", 1)
+        rsi_line = rsi_line.replace("RSI", "<b>RSI</b>", 1)
+
     parts = [emoji, trend_line, rsi_line]
     if trend_note:
         parts.append(trend_note)
@@ -321,6 +329,7 @@ def send_telegram_message(text: str):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
+        "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
     resp = requests.post(url, data=payload, timeout=15)
