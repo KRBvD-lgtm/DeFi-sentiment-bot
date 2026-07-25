@@ -1,105 +1,65 @@
-# Daily Crypto 4H Sentiment Bot
+Here it is — just select all of this text (from "# DeFi Signal Room" down to the final line) and paste it into the README editor on GitHub.
 
-Pulls 4H candles for $MORPHO, $AAVE, $SYRUP, $UNI, $AERO from Binance's free
-public API, computes a sentiment read (% change + RSI), drafts a tweet per
-coin from templates, and sends the daily digest to you on Telegram for
-review before you post. Runs for free forever on GitHub Actions.
+DeFi Signal Room — 4H Crypto Sentiment Bot
 
-No paid APIs, no VPS, no AI API costs.
+A free, fully automated bot that reads price action, momentum, and volume for 9 major DeFi/RWA tokens every 4 hours, and posts a plain-language sentiment read to a public Telegram channel — no manual analysis, no paid APIs, no VPS.
 
-## What you get every day
+Live channel: t.me/DeFiSignalRoom 
 
-A Telegram message like:
+What it does
 
-```
-📊 Daily 4H sentiment draft — 2026-07-25 12:10 UTC
+Every 4 hours (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC), the bot:
 
-— $AAVE —
-Modest strength in $AAVE, +2.3% on the 4H candle. Trend leaning up. RSI at 58, no extreme yet. Not financial advice.
+Pulls hourly price + volume data for each coin from CoinGecko's free public API
+Buckets that into 4-hour candles
+Computes, per coin: % change on the latest 4H candle, RSI(14), a 50-period multi-day trend check, volume context, and approximate support/resistance from the last ~5 days
+Turns that into a plain-language message with a 🚀 (bullish), 🐻 (bearish), or 😐 (neutral) lead
+Posts the digest automatically to the Telegram channel
+Coins tracked (ordered by market cap)
 
-— $UNI —
-$UNI chopping sideways, -0.4% on the 4H — no clear direction yet. RSI reads 47 — room to move in either direction. Not financial advice.
+$ETH, $HYPE, $LINK, $UNI, $ONDO, $AAVE, $MORPHO, $AERO, $PENDLE
 
-...
-```
+Tech stack
+Data source: CoinGecko public API — free, no key required
+Hosting/scheduling: GitHub Actions — free, no server, no VPS
+Delivery: Telegram Bot API — posts directly to a public channel
+Language: Python 3, single file (bot.py), one dependency (requests)
 
-You copy whichever draft(s) you like and post them yourself. Nothing posts
-automatically — that's the point (and it's what keeps this free, since X
-charges for automated posting access).
+Total cost: $0/month.
 
-## One-time setup (about 10 minutes)
+Repo structure
 
-### 1. Create a Telegram bot to receive the drafts
-1. In Telegram, message **@BotFather**
-2. Send `/newbot`, follow the prompts, give it any name
-3. BotFather will give you a **bot token** — save it, you'll need it below
+bot.py — the whole bot (logic, templates, delivery)
+requirements.txt — just "requests"
+.github/workflows/daily-sentiment.yml — the schedule that runs it
+README.md — this file
 
-### 2. Get your chat ID
-1. Search for your new bot in Telegram and send it any message (e.g. "hi")
-2. In a browser, visit:
-   `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates`
-   (replace `<YOUR_BOT_TOKEN>` with your actual token)
-3. Look for `"chat":{"id": ...}` in the response — that number is your **chat ID**
+How it works, in more detail
 
-### 3. Put this code on GitHub
-1. Create a new GitHub repository (private is fine, it's free)
-2. Upload all the files in this folder, keeping the `.github/workflows/`
-   folder structure intact
-   - Easiest way: on the repo page, click "Add file" → "Upload files", drag
-     everything in, including the hidden `.github` folder (use git if your
-     browser hides dotfiles — see note below)
+Data: CoinGecko doesn't expose fixed 4H candles on the free tier, so the bot pulls hourly price and volume points and buckets them into 4-hour windows itself, using the last price in each window as that candle's close.
 
-### 4. Add your secrets
-1. In your repo, go to **Settings → Secrets and variables → Actions**
-2. Click **New repository secret**, add:
-   - Name: `TELEGRAM_BOT_TOKEN` → value: your bot token from step 1
-   - Name: `TELEGRAM_CHAT_ID` → value: your chat ID from step 2
+Sentiment logic: no AI/LLM calls — this is deterministic, rule-based logic. % change and RSI get bucketed into strong bullish through strong bearish, and a pool of template phrasings is picked per bucket so wording varies run to run without needing an API call.
 
-### 5. Test it
-1. Go to the **Actions** tab in your repo
-2. Click **Daily Crypto Sentiment Draft** → **Run workflow** → **Run workflow**
-   (this is the `workflow_dispatch` trigger — it lets you fire it manually)
-3. Check Telegram — you should get the digest within ~30 seconds
+Support/resistance: approximated from the swing high/low of the last 30 closed 4H candles (about 5 days). This uses closing prices, not true intraday wicks, so treat it as a solid approximation rather than exact technical S/R.
 
-If it worked, you're done. It'll now run automatically every day at 12:10 UTC.
+Reliability: coins are fetched with an 8-second stagger between each and up to 5 retries with 20-second backoff, to stay under CoinGecko's free-tier rate limits. Occasional single-coin skips can still happen on a busy run — the bot logs those honestly rather than guessing.
 
-## Customizing
+Setup (if you're forking or rebuilding this)
+Create a Telegram bot: message @BotFather, send /newbot, follow the prompts, save the bot token it gives you.
+Create a Telegram channel (recommended) or get your personal chat ID:
+For a public channel: create a new Channel in Telegram, make it public, pick a handle, add your bot as an admin with "Post Messages" permission. Your TELEGRAM_CHAT_ID is the channel handle, e.g. @YourChannelName.
+For posting to yourself instead: message your bot directly, then visit https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates — your chat ID is the number under "chat":{"id": ...}.
+Fork or clone this repo, then add secrets in Settings, Secrets and variables, Actions, New repository secret:
+TELEGRAM_BOT_TOKEN — your bot token
+TELEGRAM_CHAT_ID — your channel handle or chat ID
+Test it: go to Actions, 4H Signal, Run workflow (use "Run workflow", not "Re-run all jobs" — the latter replays an old commit instead of your current code). Check Telegram after 1-2 minutes. It'll now run automatically every 4 hours from then on.
+Customizing
 
-- **Change coins**: edit the `COINS` list at the top of `bot.py`. Must be
-  valid Binance `...USDT` pairs (check on binance.com if unsure a pair exists)
-- **Change the time it runs**: edit the `cron` line in
-  `.github/workflows/daily-sentiment.yml`. Cron is always UTC. Candles close
-  every 4h at 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC — running ~10 min
-  after one of those gives you a just-closed candle
-- **Change sentiment thresholds/wording**: edit `trend_bucket()`,
-  `rsi_bucket()`, and the `TREND_TEMPLATES` / `RSI_NOTES` dictionaries in
-  `bot.py`
+Coins: edit the COINS list at the top of bot.py. Each entry needs a valid CoinGecko API id, found on the coin's CoinGecko page.
+Schedule: edit the cron line in .github/workflows/daily-sentiment.yml (always UTC).
+Sentiment thresholds or wording: edit trend_bucket(), rsi_bucket(), TREND_TEMPLATES, and RSI_NOTES in bot.py.
+Support/resistance lookback window: change the lookback default in support_resistance_note().
 
-## Uploading the hidden `.github` folder via a browser
+Disclaimer
 
-GitHub's drag-and-drop upload UI does support dotfiles/dot-folders, but your
-computer's file picker might hide them. If you don't see `.github` when
-browsing to upload:
-- **Mac**: in the file picker, press `Cmd+Shift+.` to reveal hidden files/folders
-- **Windows**: in File Explorer, View → Show → Hidden items, then select the
-  folder in the upload dialog
-
-Or, if you're comfortable with git:
-```bash
-git init
-git add .
-git commit -m "daily sentiment bot"
-git branch -M main
-git remote add origin <your-repo-url>
-git push -u origin main
-```
-
-## Notes
-
-- This is **not financial advice** and the sentiment logic is simple
-  (% change + RSI) — treat it as a first draft you review, not a signal to
-  trade or post blindly
-- Binance's public API has no cost and no auth for this kind of read-only
-  market data, so this has no ongoing fees
-- GitHub Actions is free for this use case (scheduled jobs on a public or
-  private repo, well within the free minutes allowance for a once-daily run)
+This is not financial advice. The sentiment logic is simple, rule-based technical analysis (price change, RSI, a moving average, volume, and swing high/low) — not a trading signal, not a recommendation, and not a substitute for your own research.
