@@ -2,11 +2,11 @@
 """
 Daily crypto 4H sentiment bot.
 
-- Pulls hourly prices from CoinGecko's public API and buckets them into 4H closes
-- Computes % change on the latest completed 4H candle + RSI(14)
+- Pulls hourly prices + volume from CoinGecko's public API and buckets them into 4H closes
+- Computes % change, RSI(14), a 50-period trend confirmation, and a volume-context note
 - Buckets that into a sentiment label
 - Fills in a template tweet (no paid AI calls, fully free)
-- Sends the daily digest to a Telegram chat, where you review and post manually
+- Sends the daily digest to a Telegram chat/channel, where you review and post manually
 
 Run manually with:  python bot.py
 Runs automatically via the GitHub Actions workflow in .github/workflows/daily-sentiment.yml
@@ -39,7 +39,7 @@ COINS = [
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/{id}/market_chart"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; sentiment-bot/1.0)"}
 BUCKET_HOURS = 4  # matches "4H" candles
-DAYS_HISTORY = 7  # gives hourly granularity with plenty of history for RSI(14)
+DAYS_HISTORY = 14  # gives hourly granularity with enough history for RSI(14) and SMA(50)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -50,10 +50,11 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 # ---------------------------------------------------------------------------
 def fetch_candles(coin_id: str, retries: int = 5):
     """
-    Fetch hourly price points from CoinGecko and bucket them into 4H closes.
-    CoinGecko doesn't apply the regional blocking that Binance's API does,
-    so this works reliably from GitHub Actions runners. Retries several
-    times on transient errors (timeouts, brief rate limits).
+    Fetch hourly price + volume points from CoinGecko and bucket them into 4H
+    closes/volumes. CoinGecko doesn't apply the regional blocking that Binance's
+    API does, so this works reliably from GitHub Actions runners. Retries
+    several times on transient errors (timeouts, brief rate limits).
+    Returns (closes, volumes) — parallel lists, oldest to newest, closed buckets only.
     """
     url = COINGECKO_URL.format(id=coin_id)
     params = {"vs_currency": "usd", "days": DAYS_HISTORY}
@@ -64,20 +65,30 @@ def fetch_candles(coin_id: str, retries: int = 5):
             resp = requests.get(url, params=params, headers=HEADERS, timeout=20)
             resp.raise_for_status()
             raw = resp.json()
-            points = raw.get("prices", [])  # list of [timestamp_ms, price]
+            price_points = raw.get("prices", [])          # [timestamp_ms, price]
+            volume_points = raw.get("total_volumes", [])  # [timestamp_ms, volume]
 
             bucket_seconds = BUCKET_HOURS * 3600
-            buckets = {}
-            for ts_ms, price in points:
+
+            price_buckets = {}
+            for ts_ms, price in price_points:
                 bucket_key = int(ts_ms // 1000) // bucket_seconds
-                buckets[bucket_key] = price  # keep overwriting -> last price in bucket wins
+                price_buckets[bucket_key] = price  # last price in bucket wins (close)
+
+            volume_buckets = {}
+            for ts_ms, vol in volume_points:
+                bucket_key = int(ts_ms // 1000) // bucket_seconds
+                volume_buckets[bucket_key] = volume_buckets.get(bucket_key, 0) + vol  # sum volume in bucket
 
             now_bucket = int(datetime.datetime.utcnow().timestamp()) // bucket_seconds
-            closed_keys = sorted(k for k in buckets if k < now_bucket)  # drop the still-forming bucket
-            closes = [buckets[k] for k in closed_keys]
+            closed_keys = sorted(k for k in price_buckets if k < now_bucket)  # drop still-forming bucket
+
+            closes = [price_buckets[k] for k in closed_keys]
+            volumes = [volume_buckets.get(k, 0) for k in closed_keys]
+
             if len(closes) < 15:
                 raise ValueError(f"only got {len(closes)} closed 4H buckets, need at least 15")
-            return closes
+            return closes, volumes
         except Exception as e:
             last_error = e
             if attempt < retries - 1:
@@ -92,6 +103,52 @@ def pct_change(closes):
     """% change of the latest completed candle vs the one before it."""
     prev, latest = closes[-2], closes[-1]
     return (latest - prev) / prev * 100
+
+
+def compute_sma(closes, period=50):
+    """Simple moving average over the last `period` closes. None if not enough data."""
+    if len(closes) < period:
+        return None
+    return sum(closes[-period:]) / period
+
+
+def trend_confirmation_note(closes):
+    """
+    Checks the latest close against a longer (50-period, ~8 days on 4H candles)
+    moving average, to say whether this 4H move lines up with or fights the
+    broader multi-day trend. Returns None if there isn't enough history yet.
+    """
+    sma = compute_sma(closes, period=50)
+    if sma is None:
+        return None
+    latest = closes[-1]
+    if latest > sma * 1.01:
+        return "This lines up with the broader multi-day uptrend."
+    elif latest < sma * 0.99:
+        return "This is running against the broader multi-day downtrend."
+    else:
+        return "Price is hovering right around its multi-day average."
+
+
+def volume_note(volumes):
+    """
+    Compares the latest closed 4H bucket's volume to the average of the prior
+    20 buckets, to flag whether this move happened on real interest or thin
+    volume. Returns None if there isn't enough history yet.
+    """
+    if len(volumes) < 21:
+        return None
+    latest_vol = volumes[-1]
+    prior_avg = sum(volumes[-21:-1]) / 20
+    if prior_avg <= 0:
+        return None
+    ratio = latest_vol / prior_avg
+    if ratio >= 1.4:
+        return "Volume is well above average — real interest behind this move."
+    elif ratio <= 0.6:
+        return "Volume is thin here — low conviction behind this move."
+    else:
+        return None  # roughly average volume, not worth commenting on
 
 
 def compute_rsi(closes, period=14):
@@ -206,13 +263,18 @@ TREND_EMOJI = {
 }
 
 
-def build_tweet(ticker, pct, rsi, t_bucket, r_bucket):
+def build_tweet(ticker, pct, rsi, t_bucket, r_bucket, trend_note=None, vol_note=None):
     emoji = TREND_EMOJI.get(t_bucket, "")
     trend_line = random.choice(TREND_TEMPLATES[t_bucket]).format(
         ticker=f"${ticker}", pct=f"{abs(pct):.1f}" if pct >= 0 else f"{pct:.1f}"
     )
     rsi_line = random.choice(RSI_NOTES[r_bucket]).format(rsi=f"{rsi:.0f}" if rsi else "N/A")
-    tweet = f"{emoji} {trend_line} {rsi_line}".strip()
+    parts = [emoji, trend_line, rsi_line]
+    if trend_note:
+        parts.append(trend_note)
+    if vol_note:
+        parts.append(vol_note)
+    tweet = " ".join(p for p in parts if p).strip()
     tweet += " Not financial advice."
     return tweet
 
@@ -247,12 +309,14 @@ def main():
         if i > 0:
             time.sleep(8)  # bigger stagger so 9 coins don't trip CoinGecko's free-tier rate limit
         try:
-            closes = fetch_candles(coin["id"])
+            closes, volumes = fetch_candles(coin["id"])
             pct = pct_change(closes)
             rsi = compute_rsi(closes)
             t_bucket = trend_bucket(pct)
             r_bucket = rsi_bucket(rsi)
-            tweet = build_tweet(coin["ticker"], pct, rsi, t_bucket, r_bucket)
+            trend_note = trend_confirmation_note(closes)
+            vol_note = volume_note(volumes)
+            tweet = build_tweet(coin["ticker"], pct, rsi, t_bucket, r_bucket, trend_note, vol_note)
 
             lines.append(f"— ${coin['ticker']} —")
             lines.append(tweet)
