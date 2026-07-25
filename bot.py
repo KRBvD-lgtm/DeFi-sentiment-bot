@@ -303,7 +303,7 @@ def send_telegram_message(text: str):
 # ---------------------------------------------------------------------------
 def main():
     today = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"📊 Daily 4H sentiment draft — {today}", ""]
+    lines = [f"📊 Daily 4H Signal — {today}", ""]
 
     for i, coin in enumerate(COINS):
         if i > 0:
