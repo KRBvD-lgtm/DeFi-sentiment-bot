@@ -82,7 +82,7 @@ def fetch_candles(coin_id: str, retries: int = 3):
         except Exception as e:
             last_error = e
             if attempt < retries - 1:
-                time.sleep(5)  # brief pause before retrying, gives rate limits time to clear
+                time.sleep(15)  # longer pause before retrying, gives rate limits real time to clear
     raise last_error
 
 
@@ -246,7 +246,7 @@ def main():
 
     for i, coin in enumerate(COINS):
         if i > 0:
-            time.sleep(2)  # small stagger so we don't hit CoinGecko's free-tier rate limit
+            time.sleep(6)  # bigger stagger so 10 coins don't trip CoinGecko's free-tier rate limit
         try:
             closes = fetch_candles(coin["id"])
             pct = pct_change(closes)
