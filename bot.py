@@ -48,11 +48,11 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 # ---------------------------------------------------------------------------
 # DATA FETCH
 # ---------------------------------------------------------------------------
-def fetch_candles(coin_id: str, retries: int = 3):
+def fetch_candles(coin_id: str, retries: int = 5):
     """
     Fetch hourly price points from CoinGecko and bucket them into 4H closes.
     CoinGecko doesn't apply the regional blocking that Binance's API does,
-    so this works reliably from GitHub Actions runners. Retries a couple
+    so this works reliably from GitHub Actions runners. Retries several
     times on transient errors (timeouts, brief rate limits).
     """
     url = COINGECKO_URL.format(id=coin_id)
@@ -81,7 +81,7 @@ def fetch_candles(coin_id: str, retries: int = 3):
         except Exception as e:
             last_error = e
             if attempt < retries - 1:
-                time.sleep(15)  # longer pause before retrying, gives rate limits real time to clear
+                time.sleep(20)  # longer pause before retrying, gives rate limits real time to clear
     raise last_error
 
 
@@ -245,7 +245,7 @@ def main():
 
     for i, coin in enumerate(COINS):
         if i > 0:
-            time.sleep(6)  # bigger stagger so 10 coins don't trip CoinGecko's free-tier rate limit
+            time.sleep(8)  # bigger stagger so 9 coins don't trip CoinGecko's free-tier rate limit
         try:
             closes = fetch_candles(coin["id"])
             pct = pct_change(closes)
