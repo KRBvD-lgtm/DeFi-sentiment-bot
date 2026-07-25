@@ -31,7 +31,6 @@ COINS = [
     {"id": "uniswap",              "ticker": "UNI"},
     {"id": "ondo-finance",         "ticker": "ONDO"},
     {"id": "aave",                 "ticker": "AAVE"},
-    {"id": "sky",                  "ticker": "SKY"},
     {"id": "morpho",               "ticker": "MORPHO"},
     {"id": "aerodrome-finance",    "ticker": "AERO"},
     {"id": "pendle",               "ticker": "PENDLE"},
