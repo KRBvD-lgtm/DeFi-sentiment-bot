@@ -22,16 +22,19 @@ import requests
 # ---------------------------------------------------------------------------
 # CONFIG — edit this list to add/remove coins. "id" must be the coin's
 # CoinGecko API id (find it on the coin's CoinGecko page, listed as "API ID").
+# Ordered by market cap, largest to smallest.
 # ---------------------------------------------------------------------------
 COINS = [
     {"id": "ethereum",             "ticker": "ETH"},
-    {"id": "morpho",               "ticker": "MORPHO"},
-    {"id": "aave",                 "ticker": "AAVE"},
-    {"id": "maple-finance",        "ticker": "SYRUP"},
+    {"id": "hyperliquid",          "ticker": "HYPE"},
+    {"id": "chainlink",            "ticker": "LINK"},
     {"id": "uniswap",              "ticker": "UNI"},
+    {"id": "ondo-finance",         "ticker": "ONDO"},
+    {"id": "aave",                 "ticker": "AAVE"},
+    {"id": "sky",                  "ticker": "SKY"},
+    {"id": "morpho",               "ticker": "MORPHO"},
     {"id": "aerodrome-finance",    "ticker": "AERO"},
     {"id": "pendle",               "ticker": "PENDLE"},
-    {"id": "ondo-finance",         "ticker": "ONDO"},
 ]
 
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/{id}/market_chart"
@@ -192,12 +195,25 @@ RSI_NOTES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# SENTIMENT EMOJI
+# ---------------------------------------------------------------------------
+TREND_EMOJI = {
+    "strong_bullish": "🚀",
+    "bullish": "🚀",
+    "neutral": "😐",
+    "bearish": "🐻",
+    "strong_bearish": "🐻",
+}
+
+
 def build_tweet(ticker, pct, rsi, t_bucket, r_bucket):
+    emoji = TREND_EMOJI.get(t_bucket, "")
     trend_line = random.choice(TREND_TEMPLATES[t_bucket]).format(
         ticker=f"${ticker}", pct=f"{abs(pct):.1f}" if pct >= 0 else f"{pct:.1f}"
     )
     rsi_line = random.choice(RSI_NOTES[r_bucket]).format(rsi=f"{rsi:.0f}" if rsi else "N/A")
-    tweet = f"{trend_line} {rsi_line}".strip()
+    tweet = f"{emoji} {trend_line} {rsi_line}".strip()
     tweet += " Not financial advice."
     return tweet
 
