@@ -2,7 +2,7 @@
 """
 Daily crypto 4H sentiment bot.
 
-- Pulls the latest 4H candles for a list of coins from Binance's public API
+- Pulls hourly prices from CoinGecko's public API and buckets them into 4H closes
 - Computes % change on the latest completed 4H candle + RSI(14)
 - Buckets that into a sentiment label
 - Fills in a template tweet (no paid AI calls, fully free)
@@ -19,19 +19,21 @@ import datetime
 import requests
 
 # ---------------------------------------------------------------------------
-# CONFIG — edit this list to add/remove coins. Must be valid Binance USDT pairs.
+# CONFIG — edit this list to add/remove coins. "id" must be the coin's
+# CoinGecko API id (find it on the coin's CoinGecko page, listed as "API ID").
 # ---------------------------------------------------------------------------
 COINS = [
-    {"symbol": "MORPHOUSDT", "ticker": "MORPHO"},
-    {"symbol": "AAVEUSDT",   "ticker": "AAVE"},
-    {"symbol": "SYRUPUSDT",  "ticker": "SYRUP"},
-    {"symbol": "UNIUSDT",    "ticker": "UNI"},
-    {"symbol": "AEROUSDT",   "ticker": "AERO"},
+    {"id": "morpho",              "ticker": "MORPHO"},
+    {"id": "aave",                "ticker": "AAVE"},
+    {"id": "maple-finance",       "ticker": "SYRUP"},
+    {"id": "uniswap",             "ticker": "UNI"},
+    {"id": "aerodrome-finance",   "ticker": "AERO"},
 ]
 
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
-INTERVAL = "4h"
-CANDLE_LIMIT = 60  # enough history for RSI(14) with room to spare
+COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/{id}/market_chart"
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; sentiment-bot/1.0)"}
+BUCKET_HOURS = 4  # matches "4H" candles
+DAYS_HISTORY = 7  # gives hourly granularity with plenty of history for RSI(14)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -40,14 +42,28 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 # ---------------------------------------------------------------------------
 # DATA FETCH
 # ---------------------------------------------------------------------------
-def fetch_candles(symbol: str):
-    """Fetch recent 4H candles for a symbol from Binance's public REST API."""
-    params = {"symbol": symbol, "interval": INTERVAL, "limit": CANDLE_LIMIT}
-    resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=15)
+def fetch_candles(coin_id: str):
+    """
+    Fetch hourly price points from CoinGecko and bucket them into 4H closes.
+    CoinGecko doesn't apply the regional blocking that Binance's API does,
+    so this works reliably from GitHub Actions runners.
+    """
+    url = COINGECKO_URL.format(id=coin_id)
+    params = {"vs_currency": "usd", "days": DAYS_HISTORY}
+    resp = requests.get(url, params=params, headers=HEADERS, timeout=20)
     resp.raise_for_status()
     raw = resp.json()
-    # Each candle: [open_time, open, high, low, close, volume, close_time, ...]
-    closes = [float(c[4]) for c in raw]
+    points = raw.get("prices", [])  # list of [timestamp_ms, price]
+
+    bucket_seconds = BUCKET_HOURS * 3600
+    buckets = {}
+    for ts_ms, price in points:
+        bucket_key = int(ts_ms // 1000) // bucket_seconds
+        buckets[bucket_key] = price  # keep overwriting -> last price in bucket wins
+
+    now_bucket = int(datetime.datetime.utcnow().timestamp()) // bucket_seconds
+    closed_keys = sorted(k for k in buckets if k < now_bucket)  # drop the still-forming bucket
+    closes = [buckets[k] for k in closed_keys]
     return closes
 
 
@@ -198,7 +214,7 @@ def main():
 
     for coin in COINS:
         try:
-            closes = fetch_candles(coin["symbol"])
+            closes = fetch_candles(coin["id"])
             pct = pct_change(closes)
             rsi = compute_rsi(closes)
             t_bucket = trend_bucket(pct)
@@ -209,7 +225,7 @@ def main():
             lines.append(tweet)
             lines.append("")
         except Exception as e:
-            print(f"Error processing {coin['symbol']}: {e}", file=sys.stderr)
+            print(f"Error processing {coin['id']}: {e}", file=sys.stderr)
             lines.append(f"— ${coin['ticker']} —")
             lines.append("⚠️ Couldn't fetch data this run, skipped.")
             lines.append("")
