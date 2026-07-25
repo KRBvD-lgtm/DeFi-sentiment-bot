@@ -3,10 +3,10 @@
 Daily crypto 4H sentiment bot.
 
 - Pulls hourly prices + volume from CoinGecko's public API and buckets them into 4H closes
-- Computes % change, RSI(14), a 50-period trend confirmation, and a volume-context note
+- Computes % change, RSI(14), a 50-period trend confirmation, volume context, and support/resistance
 - Buckets that into a sentiment label
-- Fills in a template tweet (no paid AI calls, fully free)
-- Sends the daily digest to a Telegram chat/channel, where you review and post manually
+- Fills in a plain-language message (no paid AI calls, fully free)
+- Posts the digest to a Telegram channel automatically
 
 Run manually with:  python bot.py
 Runs automatically via the GitHub Actions workflow in .github/workflows/daily-sentiment.yml
@@ -103,6 +103,33 @@ def pct_change(closes):
     """% change of the latest completed candle vs the one before it."""
     prev, latest = closes[-2], closes[-1]
     return (latest - prev) / prev * 100
+
+
+def format_price(p):
+    """Format a price sensibly whether it's $50,000 or $0.003."""
+    if p >= 100:
+        return f"{p:,.2f}"
+    elif p >= 1:
+        return f"{p:.3f}"
+    else:
+        return f"{p:.5f}"
+
+
+def support_resistance_note(closes, lookback=30):
+    """
+    Approximate support/resistance from the swing low/high over the last
+    `lookback` closed 4H candles (~5 days at 30 candles). This uses closing
+    prices, not true intraday highs/lows, so it's a solid approximation
+    rather than exact wick-to-wick S/R.
+    """
+    window = closes[-lookback:] if len(closes) >= lookback else closes
+    support = min(window)
+    resistance = max(window)
+    days = round(len(window) * BUCKET_HOURS / 24, 1)
+    return (
+        f"Nearby support ~${format_price(support)}, resistance ~${format_price(resistance)} "
+        f"(last ~{days}d)."
+    )
 
 
 def compute_sma(closes, period=50):
@@ -263,7 +290,7 @@ TREND_EMOJI = {
 }
 
 
-def build_tweet(ticker, pct, rsi, t_bucket, r_bucket, trend_note=None, vol_note=None):
+def build_tweet(ticker, pct, rsi, t_bucket, r_bucket, trend_note=None, vol_note=None, sr_note=None):
     emoji = TREND_EMOJI.get(t_bucket, "")
     trend_line = random.choice(TREND_TEMPLATES[t_bucket]).format(
         ticker=f"${ticker}", pct=f"{abs(pct):.1f}" if pct >= 0 else f"{pct:.1f}"
@@ -274,6 +301,8 @@ def build_tweet(ticker, pct, rsi, t_bucket, r_bucket, trend_note=None, vol_note=
         parts.append(trend_note)
     if vol_note:
         parts.append(vol_note)
+    if sr_note:
+        parts.append(sr_note)
     tweet = " ".join(p for p in parts if p).strip()
     tweet += " Not financial advice."
     return tweet
@@ -316,7 +345,8 @@ def main():
             r_bucket = rsi_bucket(rsi)
             trend_note = trend_confirmation_note(closes)
             vol_note = volume_note(volumes)
-            tweet = build_tweet(coin["ticker"], pct, rsi, t_bucket, r_bucket, trend_note, vol_note)
+            sr_note = support_resistance_note(closes)
+            tweet = build_tweet(coin["ticker"], pct, rsi, t_bucket, r_bucket, trend_note, vol_note, sr_note)
 
             lines.append(f"— ${coin['ticker']} —")
             lines.append(tweet)
