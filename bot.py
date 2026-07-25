@@ -312,7 +312,6 @@ def build_tweet(ticker, pct, rsi, t_bucket, r_bucket, trend_note=None, vol_note=
     if sr_note:
         parts.append(sr_note)
     tweet = " ".join(p for p in parts if p).strip()
-    tweet += " Not financial advice."
     return tweet
 
 
