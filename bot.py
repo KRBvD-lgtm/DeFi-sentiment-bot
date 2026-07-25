@@ -14,6 +14,7 @@ Runs automatically via the GitHub Actions workflow in .github/workflows/daily-se
 
 import os
 import sys
+import time
 import random
 import datetime
 import requests
@@ -23,11 +24,14 @@ import requests
 # CoinGecko API id (find it on the coin's CoinGecko page, listed as "API ID").
 # ---------------------------------------------------------------------------
 COINS = [
-    {"id": "morpho",              "ticker": "MORPHO"},
-    {"id": "aave",                "ticker": "AAVE"},
-    {"id": "maple-finance",       "ticker": "SYRUP"},
-    {"id": "uniswap",             "ticker": "UNI"},
-    {"id": "aerodrome-finance",   "ticker": "AERO"},
+    {"id": "ethereum",             "ticker": "ETH"},
+    {"id": "morpho",               "ticker": "MORPHO"},
+    {"id": "aave",                 "ticker": "AAVE"},
+    {"id": "maple-finance",        "ticker": "SYRUP"},
+    {"id": "uniswap",              "ticker": "UNI"},
+    {"id": "aerodrome-finance",    "ticker": "AERO"},
+    {"id": "pendle",               "ticker": "PENDLE"},
+    {"id": "ondo-finance",         "ticker": "ONDO"},
 ]
 
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/{id}/market_chart"
@@ -42,29 +46,41 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 # ---------------------------------------------------------------------------
 # DATA FETCH
 # ---------------------------------------------------------------------------
-def fetch_candles(coin_id: str):
+def fetch_candles(coin_id: str, retries: int = 3):
     """
     Fetch hourly price points from CoinGecko and bucket them into 4H closes.
     CoinGecko doesn't apply the regional blocking that Binance's API does,
-    so this works reliably from GitHub Actions runners.
+    so this works reliably from GitHub Actions runners. Retries a couple
+    times on transient errors (timeouts, brief rate limits).
     """
     url = COINGECKO_URL.format(id=coin_id)
     params = {"vs_currency": "usd", "days": DAYS_HISTORY}
-    resp = requests.get(url, params=params, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-    raw = resp.json()
-    points = raw.get("prices", [])  # list of [timestamp_ms, price]
 
-    bucket_seconds = BUCKET_HOURS * 3600
-    buckets = {}
-    for ts_ms, price in points:
-        bucket_key = int(ts_ms // 1000) // bucket_seconds
-        buckets[bucket_key] = price  # keep overwriting -> last price in bucket wins
+    last_error = None
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=20)
+            resp.raise_for_status()
+            raw = resp.json()
+            points = raw.get("prices", [])  # list of [timestamp_ms, price]
 
-    now_bucket = int(datetime.datetime.utcnow().timestamp()) // bucket_seconds
-    closed_keys = sorted(k for k in buckets if k < now_bucket)  # drop the still-forming bucket
-    closes = [buckets[k] for k in closed_keys]
-    return closes
+            bucket_seconds = BUCKET_HOURS * 3600
+            buckets = {}
+            for ts_ms, price in points:
+                bucket_key = int(ts_ms // 1000) // bucket_seconds
+                buckets[bucket_key] = price  # keep overwriting -> last price in bucket wins
+
+            now_bucket = int(datetime.datetime.utcnow().timestamp()) // bucket_seconds
+            closed_keys = sorted(k for k in buckets if k < now_bucket)  # drop the still-forming bucket
+            closes = [buckets[k] for k in closed_keys]
+            if len(closes) < 15:
+                raise ValueError(f"only got {len(closes)} closed 4H buckets, need at least 15")
+            return closes
+        except Exception as e:
+            last_error = e
+            if attempt < retries - 1:
+                time.sleep(5)  # brief pause before retrying, gives rate limits time to clear
+    raise last_error
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +228,9 @@ def main():
     today = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"📊 Daily 4H sentiment draft — {today}", ""]
 
-    for coin in COINS:
+    for i, coin in enumerate(COINS):
+        if i > 0:
+            time.sleep(2)  # small stagger so we don't hit CoinGecko's free-tier rate limit
         try:
             closes = fetch_candles(coin["id"])
             pct = pct_change(closes)
