@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Daily crypto 4H sentiment bot.
+Daily multi-timeframe DeFi sentiment bot.
 
-- Pulls hourly prices + volume from CoinGecko's public API and buckets them into 4H closes
-- Computes % change, RSI(14), a 50-period trend confirmation, volume context, and support/resistance
-- Buckets that into a sentiment label
-- Fills in a plain-language message with bolded key values (no paid AI calls, fully free)
-- Posts the digest to a Telegram channel automatically
+- Pulls price + volume from CoinGecko and buckets it into 4H, Daily, and Weekly closes
+- Computes % change, RSI(14), a 50-day trend confirmation, volume context, and
+  support/resistance PER coin, combining all three timeframes into one confluence read
+- Pulls live TVL (Total Value Locked) from DefiLlama for coins that are actual DeFi protocols
+- Deletes the previous post and sends a fresh one, so the channel always shows exactly one live post
+- Posts one plain-language digest per day to a Telegram channel
 
 Run manually with:  python bot.py
 Runs automatically via the GitHub Actions workflow in .github/workflows/daily-sentiment.yml
@@ -14,6 +15,7 @@ Runs automatically via the GitHub Actions workflow in .github/workflows/daily-se
 
 import os
 import sys
+import json
 import time
 import random
 import datetime
@@ -36,39 +38,54 @@ COINS = [
     {"id": "pendle",               "ticker": "PENDLE"},
 ]
 
+# Maps ticker -> the name DefiLlama lists the protocol under (case-insensitive
+# match). Base-layer tokens / oracles (ETH, HYPE, LINK) don't have a
+# meaningful "protocol TVL" the way a lending/DEX/yield protocol does, so
+# they're left out and simply won't show a TVL line.
+DEFILLAMA_NAMES = {
+    "AAVE": "aave",
+    "UNI": "uniswap",
+    "AERO": "aerodrome",
+    "MORPHO": "morpho",
+    "PENDLE": "pendle",
+    "ONDO": "ondo finance",
+}
+
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/{id}/market_chart"
+DEFILLAMA_PROTOCOLS_URL = "https://api.llama.fi/protocols"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; sentiment-bot/1.0)"}
-BUCKET_HOURS = 4  # matches "4H" candles
-DAYS_HISTORY = 14  # gives hourly granularity with enough history for RSI(14) and SMA(50)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+# Where we remember the previous post's message ID between runs, so the next
+# run can delete it before posting the new one — keeps the channel to a
+# single always-current post. This file gets committed back to the repo by
+# the GitHub Actions workflow after each run.
+STATE_FILE = "last_message.json"
+
 
 # ---------------------------------------------------------------------------
-# DATA FETCH
+# DATA FETCH — generic fetch + bucket, reused for 4H, daily, and weekly
 # ---------------------------------------------------------------------------
-def fetch_candles(coin_id: str, retries: int = 5):
+def fetch_and_bucket(coin_id: str, days: int, bucket_seconds: int, retries: int = 5, min_buckets: int = 15):
     """
-    Fetch hourly price + volume points from CoinGecko and bucket them into 4H
-    closes/volumes. CoinGecko doesn't apply the regional blocking that Binance's
-    API does, so this works reliably from GitHub Actions runners. Retries
-    several times on transient errors (timeouts, brief rate limits).
-    Returns (closes, volumes) — parallel lists, oldest to newest, closed buckets only.
+    Fetch price + volume points from CoinGecko over `days` of history, then
+    bucket them into windows of `bucket_seconds` each. Returns (closes, volumes)
+    — parallel lists, oldest to newest, closed buckets only (the still-forming
+    current bucket is dropped). Retries on transient errors / rate limits.
     """
     url = COINGECKO_URL.format(id=coin_id)
-    params = {"vs_currency": "usd", "days": DAYS_HISTORY}
+    params = {"vs_currency": "usd", "days": days}
 
     last_error = None
     for attempt in range(retries):
         try:
-            resp = requests.get(url, params=params, headers=HEADERS, timeout=20)
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=25)
             resp.raise_for_status()
             raw = resp.json()
-            price_points = raw.get("prices", [])          # [timestamp_ms, price]
-            volume_points = raw.get("total_volumes", [])  # [timestamp_ms, volume]
-
-            bucket_seconds = BUCKET_HOURS * 3600
+            price_points = raw.get("prices", [])
+            volume_points = raw.get("total_volumes", [])
 
             price_buckets = {}
             for ts_ms, price in price_points:
@@ -78,35 +95,88 @@ def fetch_candles(coin_id: str, retries: int = 5):
             volume_buckets = {}
             for ts_ms, vol in volume_points:
                 bucket_key = int(ts_ms // 1000) // bucket_seconds
-                volume_buckets[bucket_key] = volume_buckets.get(bucket_key, 0) + vol  # sum volume in bucket
+                volume_buckets[bucket_key] = volume_buckets.get(bucket_key, 0) + vol
 
             now_bucket = int(datetime.datetime.utcnow().timestamp()) // bucket_seconds
-            closed_keys = sorted(k for k in price_buckets if k < now_bucket)  # drop still-forming bucket
+            closed_keys = sorted(k for k in price_buckets if k < now_bucket)
 
             closes = [price_buckets[k] for k in closed_keys]
             volumes = [volume_buckets.get(k, 0) for k in closed_keys]
 
-            if len(closes) < 15:
-                raise ValueError(f"only got {len(closes)} closed 4H buckets, need at least 15")
+            if len(closes) < min_buckets:
+                raise ValueError(f"only got {len(closes)} closed buckets, need at least {min_buckets}")
             return closes, volumes
         except Exception as e:
             last_error = e
             if attempt < retries - 1:
-                time.sleep(20)  # longer pause before retrying, gives rate limits real time to clear
+                time.sleep(20)
     raise last_error
+
+
+def fetch_timeframes(coin_id: str):
+    """
+    Two API calls per coin:
+    - 14 days of hourly data -> bucketed into 4H closes/volumes
+    - 250 days of (auto daily-granularity) data -> bucketed into Daily closes/volumes
+      AND separately into Weekly closes/volumes from that same call
+    Returns a dict with closes_4h, volumes_4h, closes_daily, volumes_daily,
+    closes_weekly, volumes_weekly.
+    """
+    closes_4h, volumes_4h = fetch_and_bucket(coin_id, days=14, bucket_seconds=4 * 3600, min_buckets=15)
+
+    # CoinGecko auto-switches to daily granularity for days > 90, so this
+    # single call gives us enough history for both Daily and Weekly buckets.
+    closes_daily, volumes_daily = fetch_and_bucket(coin_id, days=250, bucket_seconds=86400, min_buckets=20)
+    closes_weekly, volumes_weekly = fetch_and_bucket(coin_id, days=250, bucket_seconds=7 * 86400, min_buckets=15)
+
+    return {
+        "closes_4h": closes_4h, "volumes_4h": volumes_4h,
+        "closes_daily": closes_daily, "volumes_daily": volumes_daily,
+        "closes_weekly": closes_weekly, "volumes_weekly": volumes_weekly,
+    }
+
+
+def fetch_tvl_index(retries: int = 3):
+    """
+    One call for ALL protocols at once (not per coin). Returns a dict of
+    {lowercase protocol name: protocol data} for easy lookup. Returns None
+    if the fetch fails after retries — TVL notes are skipped gracefully
+    rather than breaking the whole run.
+    """
+    for attempt in range(retries):
+        try:
+            resp = requests.get(DEFILLAMA_PROTOCOLS_URL, headers=HEADERS, timeout=25)
+            resp.raise_for_status()
+            protocols = resp.json()
+            return {p["name"].lower(): p for p in protocols if "name" in p}
+        except Exception as e:
+            print(f"TVL fetch failed (attempt {attempt + 1}): {e}", file=sys.stderr)
+            if attempt < retries - 1:
+                time.sleep(10)
+    return None
+
+
+def find_protocol(tvl_index, target_name):
+    if tvl_index is None:
+        return None
+    target = target_name.lower()
+    if target in tvl_index:
+        return tvl_index[target]
+    for name_lower, proto in tvl_index.items():
+        if target in name_lower:
+            return proto
+    return None
 
 
 # ---------------------------------------------------------------------------
 # INDICATORS
 # ---------------------------------------------------------------------------
 def pct_change(closes):
-    """% change of the latest completed candle vs the one before it."""
     prev, latest = closes[-2], closes[-1]
     return (latest - prev) / prev * 100
 
 
 def format_price(p):
-    """Format a price sensibly whether it's $50,000 or $0.003."""
     if p >= 100:
         return f"{p:,.2f}"
     elif p >= 1:
@@ -115,94 +185,38 @@ def format_price(p):
         return f"{p:.5f}"
 
 
-def support_resistance_note(closes, lookback=30):
-    """
-    Approximate support/resistance from the swing low/high over the last
-    `lookback` closed 4H candles (~5 days at 30 candles). This uses closing
-    prices, not true intraday highs/lows, so it's a solid approximation
-    rather than exact wick-to-wick S/R.
-    """
-    window = closes[-lookback:] if len(closes) >= lookback else closes
-    support = min(window)
-    resistance = max(window)
-    days = round(len(window) * BUCKET_HOURS / 24, 1)
-    return (
-        f"Nearby <b>support ~${format_price(support)}</b>, "
-        f"<b>resistance ~${format_price(resistance)}</b> (last ~{days}d)."
-    )
+def format_tvl(v):
+    if v >= 1e9:
+        return f"{v / 1e9:.2f}B"
+    elif v >= 1e6:
+        return f"{v / 1e6:.1f}M"
+    else:
+        return f"{v:,.0f}"
 
 
 def compute_sma(closes, period=50):
-    """Simple moving average over the last `period` closes. None if not enough data."""
     if len(closes) < period:
         return None
     return sum(closes[-period:]) / period
 
 
-def trend_confirmation_note(closes):
-    """
-    Checks the latest close against a longer (50-period, ~8 days on 4H candles)
-    moving average, to say whether this 4H move lines up with or fights the
-    broader multi-day trend. Returns None if there isn't enough history yet.
-    """
-    sma = compute_sma(closes, period=50)
-    if sma is None:
-        return None
-    latest = closes[-1]
-    if latest > sma * 1.01:
-        return "This lines up with the broader multi-day uptrend."
-    elif latest < sma * 0.99:
-        return "This is running against the broader multi-day downtrend."
-    else:
-        return "Price is hovering right around its multi-day average."
-
-
-def volume_note(volumes):
-    """
-    Compares the latest closed 4H bucket's volume to the average of the prior
-    20 buckets, to flag whether this move happened on real interest or thin
-    volume. Returns None if there isn't enough history yet.
-    """
-    if len(volumes) < 21:
-        return None
-    latest_vol = volumes[-1]
-    prior_avg = sum(volumes[-21:-1]) / 20
-    if prior_avg <= 0:
-        return None
-    ratio = latest_vol / prior_avg
-    if ratio >= 1.4:
-        return "Volume is well above average — real interest behind this move."
-    elif ratio <= 0.6:
-        return "Volume is thin here — low conviction behind this move."
-    else:
-        return None  # roughly average volume, not worth commenting on
-
-
 def compute_rsi(closes, period=14):
-    """Standard RSI (Wilder's smoothing) over the closes list."""
     if len(closes) < period + 1:
         return None
-
     deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
     gains = [max(d, 0) for d in deltas]
     losses = [max(-d, 0) for d in deltas]
-
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
-
     for i in range(period, len(deltas)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 
-# ---------------------------------------------------------------------------
-# SENTIMENT BUCKETING
-# ---------------------------------------------------------------------------
 def trend_bucket(pct):
     if pct >= 5:
         return "strong_bullish"
@@ -216,6 +230,14 @@ def trend_bucket(pct):
         return "neutral"
 
 
+def label_for(bucket):
+    return {
+        "strong_bullish": "Bullish", "bullish": "Bullish",
+        "neutral": "Neutral",
+        "bearish": "Bearish", "strong_bearish": "Bearish",
+    }[bucket]
+
+
 def rsi_bucket(rsi):
     if rsi is None:
         return "unknown"
@@ -227,103 +249,175 @@ def rsi_bucket(rsi):
         return "neutral"
 
 
+def trend_confirmation_note(closes, period=50, label="multi-day"):
+    sma = compute_sma(closes, period=period)
+    if sma is None:
+        return None
+    latest = closes[-1]
+    if latest > sma * 1.01:
+        return f"Price is above its {period}-period {label} average — broader trend still up."
+    elif latest < sma * 0.99:
+        return f"Price is below its {period}-period {label} average — broader trend still down."
+    else:
+        return f"Price is hovering right around its {period}-period {label} average."
+
+
+def volume_note(volumes, label="daily"):
+    if len(volumes) < 21:
+        return None
+    latest_vol = volumes[-1]
+    prior_avg = sum(volumes[-21:-1]) / 20
+    if prior_avg <= 0:
+        return None
+    ratio = latest_vol / prior_avg
+    if ratio >= 1.4:
+        return f"Volume ({label}) is well above average — real interest behind this move."
+    elif ratio <= 0.6:
+        return f"Volume ({label}) is thin here — low conviction behind this move."
+    else:
+        return None
+
+
+def support_resistance_note(closes, lookback=30, label="daily"):
+    window = closes[-lookback:] if len(closes) >= lookback else closes
+    support = min(window)
+    resistance = max(window)
+    return (
+        f"Nearby <b>support ~${format_price(support)}</b>, "
+        f"<b>resistance ~${format_price(resistance)}</b> ({label}, last ~{len(window)}{label[0]})."
+    )
+
+
+def confluence_note(daily_label, weekly_label):
+    if daily_label == weekly_label and daily_label != "Neutral":
+        return f"Daily and weekly are both {daily_label.lower()} — trend confirmed across timeframes."
+    elif daily_label != weekly_label and "Neutral" not in (daily_label, weekly_label):
+        return "Daily and weekly are pulling in different directions — mixed signal, worth waiting for confirmation."
+    else:
+        return "Broader timeframes are fairly neutral right now."
+
+
+def tvl_note(protocol):
+    if protocol is None:
+        return None
+    tvl = protocol.get("tvl")
+    change_1d = protocol.get("change_1d")
+    if tvl is None:
+        return None
+    tvl_str = format_tvl(tvl)
+    if change_1d is None:
+        return f"<b>TVL ${tvl_str}</b>."
+    direction = "up" if change_1d >= 0 else "down"
+    return f"<b>TVL ${tvl_str}</b>, {direction} <b>{abs(change_1d):.1f}%</b> over 24h."
+
+
 # ---------------------------------------------------------------------------
-# TEMPLATES — plain-language, no LLM call, picked pseudo-randomly per run
+# TEMPLATES + EMOJI
 # ---------------------------------------------------------------------------
-TREND_TEMPLATES = {
-    "strong_bullish": [
-        "{ticker} ripping on the 4H, up {pct}%. Momentum is clearly with the buyers right now.",
-        "Strong move on {ticker} — {pct}% higher on the 4H candle. Buyers firmly in control.",
-        "{ticker} breaking out, +{pct}% on the 4H. This is a real momentum candle, not noise.",
-    ],
-    "bullish": [
-        "{ticker} grinding higher, up {pct}% on the 4H. Buyers have a slight edge.",
-        "Modest strength in {ticker}, +{pct}% on the 4H candle. Trend leaning up.",
-        "{ticker} ticking up {pct}% on the 4H — nothing explosive, but the bias is bullish.",
-    ],
-    "neutral": [
-        "{ticker} basically flat on the 4H, {pct}%. Market's undecided here.",
-        "Quiet 4H candle for {ticker}, {pct}% change. Range-bound for now.",
-        "{ticker} chopping sideways, {pct}% on the 4H — no clear direction yet.",
-    ],
-    "bearish": [
-        "{ticker} slipping, down {pct}% on the 4H. Sellers have a slight edge.",
-        "Modest weakness in {ticker}, {pct}% on the 4H candle. Bias leaning down.",
-        "{ticker} cooling off, {pct}% on the 4H — nothing dramatic, but sellers are active.",
-    ],
-    "strong_bearish": [
-        "{ticker} getting hit hard, {pct}% on the 4H. Sellers firmly in control.",
-        "Sharp drop on {ticker} — {pct}% on the 4H candle. Real selling pressure here.",
-        "{ticker} breaking down, {pct}% on the 4H. This is a real distribution candle, not noise.",
-    ],
-}
+TREND_EMOJI = {"Bullish": "🚀", "Neutral": "😐", "Bearish": "🐻"}
 
 RSI_NOTES = {
-    "overbought": [
-        "RSI at {rsi} — stretched, watch for a pullback.",
-        "RSI reads {rsi}, into overbought territory.",
-        "RSI sitting at {rsi}, getting hot up here.",
-    ],
-    "oversold": [
-        "RSI at {rsi} — stretched to the downside, watch for a bounce.",
-        "RSI reads {rsi}, into oversold territory.",
-        "RSI sitting at {rsi}, getting washed out down here.",
-    ],
-    "neutral": [
-        "RSI at {rsi}, nothing extreme either way.",
-        "RSI reads {rsi} — room to move in either direction.",
-        "RSI sitting at {rsi}, no extreme yet.",
-    ],
+    "overbought": ["RSI stretched, watch for a pullback.", "RSI into overbought territory."],
+    "oversold": ["RSI stretched to the downside, watch for a bounce.", "RSI into oversold territory."],
+    "neutral": ["RSI has room to move either direction.", "RSI shows no extreme yet."],
     "unknown": [""],
 }
 
 
-# ---------------------------------------------------------------------------
-# SENTIMENT EMOJI
-# ---------------------------------------------------------------------------
-TREND_EMOJI = {
-    "strong_bullish": "🚀",
-    "bullish": "🚀",
-    "neutral": "😐",
-    "bearish": "🐻",
-    "strong_bearish": "🐻",
-}
+def overall_emoji(daily_label, weekly_label, h4_label):
+    from collections import Counter
+    counts = Counter([daily_label, weekly_label, h4_label])
+    winner = counts.most_common(1)[0][0]
+    return TREND_EMOJI[winner]
 
 
-def build_tweet(ticker, pct, rsi, t_bucket, r_bucket, trend_note=None, vol_note=None, sr_note=None):
-    emoji = TREND_EMOJI.get(t_bucket, "")
-    pct_display = f"{abs(pct):.1f}" if pct >= 0 else f"{pct:.1f}"
-    trend_line = random.choice(TREND_TEMPLATES[t_bucket]).format(
-        ticker=f"${ticker}", pct=pct_display
+def build_message(ticker, tf, daily_rsi, protocol):
+    pct_4h = pct_change(tf["closes_4h"])
+    pct_daily = pct_change(tf["closes_daily"])
+    pct_weekly = pct_change(tf["closes_weekly"])
+
+    label_4h = label_for(trend_bucket(pct_4h))
+    label_daily = label_for(trend_bucket(pct_daily))
+    label_weekly = label_for(trend_bucket(pct_weekly))
+
+    emoji = overall_emoji(label_daily, label_weekly, label_4h)
+
+    def fmt_pct(p):
+        return f"<b>{p:+.1f}%</b>"
+
+    headline = (
+        f"{emoji} <b>${ticker}</b> — 4H {fmt_pct(pct_4h)} ({label_4h}) | "
+        f"Daily {fmt_pct(pct_daily)} ({label_daily}) | "
+        f"Weekly {fmt_pct(pct_weekly)} ({label_weekly})"
     )
-    trend_line = trend_line.replace(f"{pct_display}%", f"<b>{pct_display}%</b>", 1)
 
-    rsi_display = f"{rsi:.0f}" if rsi else "N/A"
-    rsi_line = random.choice(RSI_NOTES[r_bucket]).format(rsi=rsi_display)
+    conf_note = confluence_note(label_daily, label_weekly)
+
+    rsi_bucket_label = rsi_bucket(daily_rsi)
+    rsi_display = f"{daily_rsi:.0f}" if daily_rsi is not None else "N/A"
+    rsi_line = random.choice(RSI_NOTES[rsi_bucket_label])
     if rsi_line:
-        rsi_line = rsi_line.replace(rsi_display, f"<b>{rsi_display}</b>", 1)
-        rsi_line = rsi_line.replace("RSI", "<b>RSI</b>", 1)
+        rsi_line = f"<b>RSI</b> (Daily) <b>{rsi_display}</b> — {rsi_line[4:] if rsi_line.startswith('RSI ') else rsi_line}"
 
-    parts = [emoji, trend_line, rsi_line]
-    if trend_note:
-        parts.append(trend_note)
-    if vol_note:
-        parts.append(vol_note)
-    if sr_note:
-        parts.append(sr_note)
-    tweet = " ".join(p for p in parts if p).strip()
-    return tweet
+    vol_note = volume_note(tf["volumes_daily"], label="daily")
+    sr_note = support_resistance_note(tf["closes_daily"], lookback=30, label="daily")
+    tvl_line = tvl_note(protocol)
+
+    parts = [headline, conf_note, rsi_line, vol_note, sr_note, tvl_line]
+    return "\n".join(p for p in parts if p)
+
+
+# ---------------------------------------------------------------------------
+# STATE — remember the last posted message so we can delete it next run
+# ---------------------------------------------------------------------------
+def load_last_message_id():
+    if not os.path.exists(STATE_FILE):
+        return None
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        return data.get("message_id")
+    except Exception as e:
+        print(f"Couldn't read state file, treating as no previous message: {e}", file=sys.stderr)
+        return None
+
+
+def save_last_message_id(message_id):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({"message_id": message_id}, f)
+    except Exception as e:
+        print(f"Couldn't write state file: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
 # TELEGRAM DELIVERY
 # ---------------------------------------------------------------------------
+def delete_telegram_message(message_id):
+    """
+    Deletes the previous post so the channel only ever shows one live post.
+    Fails silently (just logs) if the message is already gone, too old, or
+    the bot lacks delete rights — a failed delete should never stop the new
+    post from going out.
+    """
+    if not message_id or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id}
+    try:
+        resp = requests.post(url, data=payload, timeout=15)
+        if not resp.ok:
+            print(f"Couldn't delete previous message (non-fatal): {resp.text}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error deleting previous message (non-fatal): {e}", file=sys.stderr)
+
+
 def send_telegram_message(text: str):
+    """Sends the message and returns the new message_id, or None if not sent."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — printing instead of sending.\n")
         print(text)
-        return
-
+        return None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -333,6 +427,8 @@ def send_telegram_message(text: str):
     }
     resp = requests.post(url, data=payload, timeout=15)
     resp.raise_for_status()
+    result = resp.json()
+    return result.get("result", {}).get("message_id")
 
 
 # ---------------------------------------------------------------------------
@@ -340,24 +436,21 @@ def send_telegram_message(text: str):
 # ---------------------------------------------------------------------------
 def main():
     today = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"📊 4H Signal — {today}", ""]
+    lines = [f"📊 Daily Signal — {today}", ""]
+
+    tvl_index = fetch_tvl_index()
 
     for i, coin in enumerate(COINS):
         if i > 0:
-            time.sleep(8)  # bigger stagger so 9 coins don't trip CoinGecko's free-tier rate limit
+            time.sleep(8)
         try:
-            closes, volumes = fetch_candles(coin["id"])
-            pct = pct_change(closes)
-            rsi = compute_rsi(closes)
-            t_bucket = trend_bucket(pct)
-            r_bucket = rsi_bucket(rsi)
-            trend_note = trend_confirmation_note(closes)
-            vol_note = volume_note(volumes)
-            sr_note = support_resistance_note(closes)
-            tweet = build_tweet(coin["ticker"], pct, rsi, t_bucket, r_bucket, trend_note, vol_note, sr_note)
-
-            lines.append(f"— ${coin['ticker']} —")
-            lines.append(tweet)
+            tf = fetch_timeframes(coin["id"])
+            daily_rsi = compute_rsi(tf["closes_daily"])
+            protocol = None
+            if coin["ticker"] in DEFILLAMA_NAMES:
+                protocol = find_protocol(tvl_index, DEFILLAMA_NAMES[coin["ticker"]])
+            message = build_message(coin["ticker"], tf, daily_rsi, protocol)
+            lines.append(message)
             lines.append("")
         except Exception as e:
             print(f"Error processing {coin['id']}: {e}", file=sys.stderr)
@@ -365,8 +458,15 @@ def main():
             lines.append("⚠️ Couldn't fetch data this run, skipped.")
             lines.append("")
 
-    message = "\n".join(lines).strip()
-    send_telegram_message(message)
+    full_message = "\n".join(lines).strip()
+
+    last_id = load_last_message_id()
+    delete_telegram_message(last_id)
+
+    new_id = send_telegram_message(full_message)
+    if new_id:
+        save_last_message_id(new_id)
+
     print("Done.")
 
 
