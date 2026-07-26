@@ -6,7 +6,6 @@ Daily multi-timeframe DeFi sentiment bot.
 - Computes % change, RSI(14), a 50-day trend confirmation, volume context, and
   support/resistance PER coin, combining all three timeframes into one confluence read
 - Pulls live TVL (Total Value Locked) from DefiLlama for coins that are actual DeFi protocols
-- Adds a standalone $BTC section (.618 Fib retracement, weekly 200MA, weekly 200EMA)
 - Deletes the previous post and sends a fresh one, so the channel always shows exactly one live post
 
 Run manually with:  python bot.py
@@ -136,64 +135,6 @@ def fetch_timeframes(coin_id: str):
     }
 
 
-def fetch_btc_weekly_history(retries: int = 5, min_buckets: int = 210):
-    """
-    Fetches BTC's full available price history (days='max') and buckets it
-    into weekly closes. A 200-week moving average needs ~4 years of weekly
-    data, far more than the 250-day window used for the other 9 coins, so
-    this gets its own call with much deeper history.
-    """
-    url = COINGECKO_URL.format(id="bitcoin")
-    params = {"vs_currency": "usd", "days": "max"}
-
-    last_error = None
-    for attempt in range(retries):
-        try:
-            resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
-            resp.raise_for_status()
-            raw = resp.json()
-            price_points = raw.get("prices", [])
-
-            bucket_seconds = 7 * 86400
-            price_buckets = {}
-            for ts_ms, price in price_points:
-                bucket_key = int(ts_ms // 1000) // bucket_seconds
-                price_buckets[bucket_key] = price
-
-            now_bucket = int(datetime.datetime.utcnow().timestamp()) // bucket_seconds
-            closed_keys = sorted(k for k in price_buckets if k < now_bucket)
-            closes_weekly = [price_buckets[k] for k in closed_keys]
-
-            if len(closes_weekly) < min_buckets:
-                raise ValueError(f"only got {len(closes_weekly)} weekly buckets, need at least {min_buckets}")
-            return closes_weekly
-        except Exception as e:
-            last_error = e
-            if attempt < retries - 1:
-                time.sleep(20)
-    raise last_error
-
-
-def build_btc_section():
-    """Builds the standalone BTC section: .618 Fib retracement, weekly 200MA, weekly 200EMA."""
-    closes_weekly = fetch_btc_weekly_history()
-    current_price = closes_weekly[-1]
-
-    sma200 = compute_sma(closes_weekly, period=200)
-    ema200 = compute_ema(closes_weekly, period=200)
-    fib = fib_618_level(closes_weekly, lookback=104)
-
-    lines = ["₿ <b>$BTC</b>", f"Current price: <b>${format_price(current_price)}</b>"]
-    if fib is not None:
-        level, high, low = fib
-        lines.append(f".618 Fibonacci Retracement: <b>${format_price(level)}</b>")
-    if sma200 is not None:
-        lines.append(f"Weekly 200MA: <b>${format_price(sma200)}</b>")
-    if ema200 is not None:
-        lines.append(f"Weekly 200EMA: <b>${format_price(ema200)}</b>")
-    return "\n".join(lines)
-
-
 def fetch_tvl_index(retries: int = 3):
     """
     One call for ALL protocols at once (not per coin). Returns a dict of
@@ -256,41 +197,6 @@ def compute_sma(closes, period=50):
     if len(closes) < period:
         return None
     return sum(closes[-period:]) / period
-
-
-def compute_ema(closes, period=200):
-    """Standard EMA: seeded with the SMA of the first `period` closes, then
-    rolled forward through the rest of the series. None if not enough data."""
-    if len(closes) < period:
-        return None
-    multiplier = 2 / (period + 1)
-    ema = sum(closes[:period]) / period
-    for price in closes[period:]:
-        ema = (price - ema) * multiplier + ema
-    return ema
-
-
-def fib_618_level(closes, lookback=104):
-    """
-    .618 Fibonacci retracement level, based on the swing high/low over the
-    last `lookback` closes (104 weekly closes ≈ 2 years, a practical window
-    rather than reaching back to all-time extremes). Determines direction
-    by whether the high or the low came first, so the retracement level
-    makes directional sense (support in an uptrend, resistance in a downtrend).
-    Returns (level, swing_high, swing_low), or None if not enough data.
-    """
-    window = closes[-lookback:] if len(closes) >= lookback else closes
-    if len(window) < 10:
-        return None
-    high = max(window)
-    low = min(window)
-    idx_high = window.index(high)
-    idx_low = window.index(low)
-    if idx_high > idx_low:
-        level = high - 0.618 * (high - low)  # uptrend leg -> retracement support
-    else:
-        level = low + 0.618 * (high - low)   # downtrend leg -> retracement resistance
-    return level, high, low
 
 
 def compute_rsi(closes, period=14):
@@ -439,6 +345,7 @@ def build_message(ticker, tf, daily_rsi, protocol):
         return f"<b>{p:+.1f}%</b>"
 
     title_line = f"{emoji} <b>${ticker}</b>"
+    price_line = f"Price: <b>${format_price(tf['closes_daily'][-1])}</b>"
     line_4h = f"4H: {fmt_pct(pct_4h)} ({label_4h})"
     line_daily = f"Daily: {fmt_pct(pct_daily)} ({label_daily})"
     line_weekly = f"Weekly: {fmt_pct(pct_weekly)} ({label_weekly})"
@@ -455,7 +362,7 @@ def build_message(ticker, tf, daily_rsi, protocol):
     sr_note = support_resistance_note(tf["closes_daily"], lookback=30, label="daily")
     tvl_line = tvl_note(protocol)
 
-    parts = [title_line, line_4h, line_daily, line_weekly, conf_note, rsi_line, vol_note, sr_note, tvl_line]
+    parts = [title_line, price_line, line_4h, line_daily, line_weekly, conf_note, rsi_line, vol_note, sr_note, tvl_line]
     return "\n".join(p for p in parts if p)
 
 
@@ -549,14 +456,6 @@ def main():
             lines.append(f"— ${coin['ticker']} —")
             lines.append("⚠️ Couldn't fetch data this run, skipped.")
             lines.append("")
-
-    try:
-        btc_section = build_btc_section()
-        lines.append(btc_section)
-    except Exception as e:
-        print(f"Error processing BTC section: {e}", file=sys.stderr)
-        lines.append("₿ <b>$BTC</b>")
-        lines.append("⚠️ Couldn't fetch data this run, skipped.")
 
     full_message = "\n".join(lines).strip()
 
