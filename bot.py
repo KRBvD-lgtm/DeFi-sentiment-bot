@@ -54,6 +54,14 @@ COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/{id}/market_chart"
 DEFILLAMA_PROTOCOLS_URL = "https://api.llama.fi/protocols"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; sentiment-bot/1.0)"}
 
+# Free CoinGecko "Demo" API key (sign up free at coingecko.com — no cost).
+# Without this, requests are fully anonymous, which CoinGecko explicitly
+# rate-limits harder and may serve more aggressively cached (stale) data.
+# With it, we also get reliable access to interval=hourly for the 4H fetch.
+COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY")
+if COINGECKO_API_KEY:
+    HEADERS["x-cg-demo-api-key"] = COINGECKO_API_KEY
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -67,15 +75,22 @@ STATE_FILE = "last_message.json"
 # ---------------------------------------------------------------------------
 # DATA FETCH — generic fetch + bucket, reused for 4H, daily, and weekly
 # ---------------------------------------------------------------------------
-def fetch_and_bucket(coin_id: str, days: int, bucket_seconds: int, retries: int = 5, min_buckets: int = 15):
+def fetch_and_bucket(coin_id: str, days: int, bucket_seconds: int, retries: int = 5, min_buckets: int = 15, interval: str = None):
     """
     Fetch price + volume points from CoinGecko over `days` of history, then
     bucket them into windows of `bucket_seconds` each. Returns (closes, volumes)
     — parallel lists, oldest to newest, closed buckets only (the still-forming
     current bucket is dropped). Retries on transient errors / rate limits.
+
+    `interval` can be set to "hourly" to force real hourly granularity
+    (CoinGecko supports this on the free tier for ranges up to 100 days) —
+    without it, auto-granularity behavior has been inconsistent and can
+    silently return coarser data than expected.
     """
     url = COINGECKO_URL.format(id=coin_id)
     params = {"vs_currency": "usd", "days": days}
+    if interval:
+        params["interval"] = interval
 
     last_error = None
     for attempt in range(retries):
@@ -121,7 +136,7 @@ def fetch_timeframes(coin_id: str):
     Returns a dict with closes_4h, volumes_4h, closes_daily, volumes_daily,
     closes_weekly, volumes_weekly.
     """
-    closes_4h, volumes_4h = fetch_and_bucket(coin_id, days=14, bucket_seconds=4 * 3600, min_buckets=15)
+    closes_4h, volumes_4h = fetch_and_bucket(coin_id, days=14, bucket_seconds=4 * 3600, min_buckets=15, interval="hourly")
 
     # CoinGecko auto-switches to daily granularity for days > 90, so this
     # single call gives us enough history for both Daily and Weekly buckets.
