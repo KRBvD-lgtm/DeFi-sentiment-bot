@@ -2,7 +2,8 @@
 """
 Daily multi-timeframe DeFi sentiment bot.
 
-- Pulls price + volume from CoinGecko and buckets it into 4H, Daily, and Weekly closes
+- Pulls live price + volume data from Gate.io's exchange (real-time, no API key needed)
+  and computes native 4H, Daily, and Weekly candles
 - Computes % change, RSI(14), a 50-day trend confirmation, volume context, and
   support/resistance PER coin, combining all three timeframes into one confluence read
 - Pulls live TVL (Total Value Locked) from DefiLlama for coins that are actual DeFi protocols
@@ -21,20 +22,12 @@ import datetime
 import requests
 
 # ---------------------------------------------------------------------------
-# CONFIG — edit this list to add/remove coins. "id" must be the coin's
-# CoinGecko API id (find it on the coin's CoinGecko page, listed as "API ID").
+# CONFIG — just the ticker symbol, used directly as {TICKER}_USDT on Gate.io.
 # Ordered by market cap, largest to smallest.
 # ---------------------------------------------------------------------------
 COINS = [
-    {"id": "ethereum",             "ticker": "ETH"},
-    {"id": "hyperliquid",          "ticker": "HYPE"},
-    {"id": "chainlink",            "ticker": "LINK"},
-    {"id": "uniswap",              "ticker": "UNI"},
-    {"id": "ondo-finance",         "ticker": "ONDO"},
-    {"id": "aave",                 "ticker": "AAVE"},
-    {"id": "morpho",               "ticker": "MORPHO"},
-    {"id": "aerodrome-finance",    "ticker": "AERO"},
-    {"id": "pendle",               "ticker": "PENDLE"},
+    "ETH", "HYPE", "LINK", "UNI", "ONDO",
+    "AAVE", "MORPHO", "AERO", "PENDLE",
 ]
 
 # Maps ticker -> the name DefiLlama lists the protocol under (case-insensitive
@@ -50,17 +43,10 @@ DEFILLAMA_NAMES = {
     "ONDO": "ondo finance",
 }
 
-COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/{id}/market_chart"
+GATE_CANDLES_URL = "https://api.gateio.ws/api/v4/spot/candlesticks"
+GATE_TICKER_URL = "https://api.gateio.ws/api/v4/spot/tickers"
 DEFILLAMA_PROTOCOLS_URL = "https://api.llama.fi/protocols"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; sentiment-bot/1.0)"}
-
-# Free CoinGecko "Demo" API key (sign up free at coingecko.com — no cost).
-# Without this, requests are fully anonymous, which CoinGecko explicitly
-# rate-limits harder and may serve more aggressively cached (stale) data.
-# With it, we also get reliable access to interval=hourly for the 4H fetch.
-COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY")
-if COINGECKO_API_KEY:
-    HEADERS["x-cg-demo-api-key"] = COINGECKO_API_KEY
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -73,80 +59,92 @@ STATE_FILE = "last_message.json"
 
 
 # ---------------------------------------------------------------------------
-# DATA FETCH — generic fetch + bucket, reused for 4H, daily, and weekly
+# DATA FETCH — live exchange data from Gate.io (no API key needed, no
+# regional blocking observed for public market data, broad altcoin coverage)
 # ---------------------------------------------------------------------------
-def fetch_and_bucket(coin_id: str, days: int, bucket_seconds: int, retries: int = 5, min_buckets: int = 15, interval: str = None):
+def fetch_gate_candles(ticker: str, interval: str, limit: int = 100, retries: int = 5):
     """
-    Fetch price + volume points from CoinGecko over `days` of history, then
-    bucket them into windows of `bucket_seconds` each. Returns (closes, volumes)
-    — parallel lists, oldest to newest, closed buckets only (the still-forming
-    current bucket is dropped). Retries on transient errors / rate limits.
-
-    `interval` can be set to "hourly" to force real hourly granularity
-    (CoinGecko supports this on the free tier for ranges up to 100 days) —
-    without it, auto-granularity behavior has been inconsistent and can
-    silently return coarser data than expected.
+    Fetch native candles directly from Gate.io's public spot market API.
+    Each raw candle is [timestamp, quote_volume, close, high, low, open].
+    Returns a list of dicts, oldest to newest, sorted by timestamp.
     """
-    url = COINGECKO_URL.format(id=coin_id)
-    params = {"vs_currency": "usd", "days": days}
-    if interval:
-        params["interval"] = interval
-
+    pair = f"{ticker}_USDT"
+    params = {"currency_pair": pair, "interval": interval, "limit": limit}
     last_error = None
     for attempt in range(retries):
         try:
-            resp = requests.get(url, params=params, headers=HEADERS, timeout=25)
+            resp = requests.get(GATE_CANDLES_URL, params=params, headers=HEADERS, timeout=20)
             resp.raise_for_status()
             raw = resp.json()
-            price_points = raw.get("prices", [])
-            volume_points = raw.get("total_volumes", [])
-
-            price_buckets = {}
-            for ts_ms, price in price_points:
-                bucket_key = int(ts_ms // 1000) // bucket_seconds
-                price_buckets[bucket_key] = price  # last price in bucket wins (close)
-
-            volume_buckets = {}
-            for ts_ms, vol in volume_points:
-                bucket_key = int(ts_ms // 1000) // bucket_seconds
-                volume_buckets[bucket_key] = volume_buckets.get(bucket_key, 0) + vol
-
-            now_bucket = int(datetime.datetime.utcnow().timestamp()) // bucket_seconds
-            closed_keys = sorted(k for k in price_buckets if k < now_bucket)
-
-            closes = [price_buckets[k] for k in closed_keys]
-            volumes = [volume_buckets.get(k, 0) for k in closed_keys]
-
-            if len(closes) < min_buckets:
-                raise ValueError(f"only got {len(closes)} closed buckets, need at least {min_buckets}")
-            return closes, volumes
+            if not raw or not isinstance(raw, list):
+                raise ValueError(f"empty or unexpected candle response: {raw}")
+            candles = []
+            for c in raw:
+                candles.append({
+                    "ts": int(c[0]),
+                    "volume": float(c[1]),
+                    "close": float(c[2]),
+                    "high": float(c[3]),
+                    "low": float(c[4]),
+                    "open": float(c[5]),
+                })
+            candles.sort(key=lambda x: x["ts"])
+            return candles
         except Exception as e:
             last_error = e
             if attempt < retries - 1:
-                time.sleep(20)
+                time.sleep(15)
     raise last_error
 
 
-def fetch_timeframes(coin_id: str):
-    """
-    Two API calls per coin:
-    - 14 days of hourly data -> bucketed into 4H closes/volumes
-    - 250 days of (auto daily-granularity) data -> bucketed into Daily closes/volumes
-      AND separately into Weekly closes/volumes from that same call
-    Returns a dict with closes_4h, volumes_4h, closes_daily, volumes_daily,
-    closes_weekly, volumes_weekly.
-    """
-    closes_4h, volumes_4h = fetch_and_bucket(coin_id, days=14, bucket_seconds=4 * 3600, min_buckets=15, interval="hourly")
+def fetch_live_price(ticker: str, retries: int = 3):
+    """Fetch the true real-time last-traded price from Gate.io's ticker endpoint."""
+    pair = f"{ticker}_USDT"
+    params = {"currency_pair": pair}
+    for attempt in range(retries):
+        try:
+            resp = requests.get(GATE_TICKER_URL, params=params, headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list) and data:
+                return float(data[0]["last"])
+        except Exception as e:
+            print(f"Live price fetch failed (attempt {attempt + 1}): {e}", file=sys.stderr)
+            if attempt < retries - 1:
+                time.sleep(5)
+    return None
 
-    # CoinGecko auto-switches to daily granularity for days > 90, so this
-    # single call gives us enough history for both Daily and Weekly buckets.
-    closes_daily, volumes_daily = fetch_and_bucket(coin_id, days=250, bucket_seconds=86400, min_buckets=20)
-    closes_weekly, volumes_weekly = fetch_and_bucket(coin_id, days=250, bucket_seconds=7 * 86400, min_buckets=15)
+
+def fetch_timeframes(ticker: str):
+    """
+    Three native-candle fetches from Gate.io: 4H, Daily (1d), and Weekly (7d).
+    The most recent candle in each response is still "live"/forming, so it's
+    dropped for analysis — % change, RSI, etc. are computed on closed candles
+    only. The true current price is fetched separately via the live ticker.
+    """
+    c4h = fetch_gate_candles(ticker, "4h", limit=60)
+    c1d = fetch_gate_candles(ticker, "1d", limit=300)
+    c7d = fetch_gate_candles(ticker, "7d", limit=60)
+
+    closes_4h = [c["close"] for c in c4h[:-1]]
+    volumes_4h = [c["volume"] for c in c4h[:-1]]
+    closes_daily = [c["close"] for c in c1d[:-1]]
+    volumes_daily = [c["volume"] for c in c1d[:-1]]
+    closes_weekly = [c["close"] for c in c7d[:-1]]
+    volumes_weekly = [c["volume"] for c in c7d[:-1]]
+
+    if len(closes_4h) < 15 or len(closes_daily) < 20 or len(closes_weekly) < 15:
+        raise ValueError("not enough closed candles returned from Gate.io")
+
+    live_price = fetch_live_price(ticker)
+    if live_price is None:
+        live_price = closes_daily[-1]  # fall back to last closed daily candle
 
     return {
         "closes_4h": closes_4h, "volumes_4h": volumes_4h,
         "closes_daily": closes_daily, "volumes_daily": volumes_daily,
         "closes_weekly": closes_weekly, "volumes_weekly": volumes_weekly,
+        "live_price": live_price,
     }
 
 
@@ -360,7 +358,7 @@ def build_message(ticker, tf, daily_rsi, protocol):
         return f"<b>{p:+.1f}%</b>"
 
     title_line = f"{emoji} <b>${ticker}</b>"
-    price_line = f"Price: <b>${format_price(tf['closes_daily'][-1])}</b>"
+    price_line = f"Price: <b>${format_price(tf['live_price'])}</b>"
     line_4h = f"4H: {fmt_pct(pct_4h)} ({label_4h})"
     line_daily = f"Daily: {fmt_pct(pct_daily)} ({label_daily})"
     line_weekly = f"Weekly: {fmt_pct(pct_weekly)} ({label_weekly})"
@@ -454,21 +452,21 @@ def main():
 
     tvl_index = fetch_tvl_index()
 
-    for i, coin in enumerate(COINS):
+    for i, ticker in enumerate(COINS):
         if i > 0:
             time.sleep(8)
         try:
-            tf = fetch_timeframes(coin["id"])
+            tf = fetch_timeframes(ticker)
             daily_rsi = compute_rsi(tf["closes_daily"])
             protocol = None
-            if coin["ticker"] in DEFILLAMA_NAMES:
-                protocol = find_protocol(tvl_index, DEFILLAMA_NAMES[coin["ticker"]])
-            message = build_message(coin["ticker"], tf, daily_rsi, protocol)
+            if ticker in DEFILLAMA_NAMES:
+                protocol = find_protocol(tvl_index, DEFILLAMA_NAMES[ticker])
+            message = build_message(ticker, tf, daily_rsi, protocol)
             lines.append(message)
             lines.append("")
         except Exception as e:
-            print(f"Error processing {coin['id']}: {e}", file=sys.stderr)
-            lines.append(f"— ${coin['ticker']} —")
+            print(f"Error processing {ticker}: {e}", file=sys.stderr)
+            lines.append(f"— ${ticker} —")
             lines.append("⚠️ Couldn't fetch data this run, skipped.")
             lines.append("")
 
