@@ -1,65 +1,71 @@
-Here it is — just select all of this text (from "# DeFi Signal Room" down to the final line) and paste it into the README editor on GitHub.
-
-DeFi Signal Room — 4H Crypto Sentiment Bot
-
-A free, fully automated bot that reads price action, momentum, and volume for 9 major DeFi/RWA tokens every 4 hours, and posts a plain-language sentiment read to a public Telegram channel — no manual analysis, no paid APIs, no VPS.
-
-Live channel: t.me/DeFiSignalRoom 
-
-What it does
-
-Every 4 hours (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC), the bot:
-
-Pulls hourly price + volume data for each coin from CoinGecko's free public API
-Buckets that into 4-hour candles
-Computes, per coin: % change on the latest 4H candle, RSI(14), a 50-period multi-day trend check, volume context, and approximate support/resistance from the last ~5 days
-Turns that into a plain-language message with a 🚀 (bullish), 🐻 (bearish), or 😐 (neutral) lead
-Posts the digest automatically to the Telegram channel
-Coins tracked (ordered by market cap)
-
-$ETH, $HYPE, $LINK, $UNI, $ONDO, $AAVE, $MORPHO, $AERO, $PENDLE
-
 Tech stack
-Data source: CoinGecko public API — free, no key required
+Price/candle data: Gate.io public API — free, no key required, live exchange data, no regional blocking observed for public market data
+TVL data: DefiLlama public API — free, no key required
 Hosting/scheduling: GitHub Actions — free, no server, no VPS
-Delivery: Telegram Bot API — posts directly to a public channel
+Delivery: Telegram Bot API — posts directly to a public channel, deletes its own previous post each run
 Language: Python 3, single file (bot.py), one dependency (requests)
 
 Total cost: $0/month.
 
 Repo structure
-
-bot.py — the whole bot (logic, templates, delivery)
-requirements.txt — just "requests"
-.github/workflows/daily-sentiment.yml — the schedule that runs it
-README.md — this file
-
+.
+├── bot.py                                    # the whole bot — data, indicators, message, delivery
+├── requirements.txt                          # just `requests`
+├── last_message.json                         # auto-managed state file (previous post's message ID)
+├── .github/workflows/daily-sentiment.yml     # the cron schedule that runs it
+└── README.md
 How it works, in more detail
 
-Data: CoinGecko doesn't expose fixed 4H candles on the free tier, so the bot pulls hourly price and volume points and buckets them into 4-hour windows itself, using the last price in each window as that candle's close.
+Data source: Gate.io was chosen over CoinGecko's free tier after running into stale/delayed data on CoinGecko's anonymous public API. Gate.io's candlestick endpoint returns real, native OHLCV candles at 4H/Daily/Weekly granularity directly — no manual bucketing needed — and the separate ticker call gives a genuinely real-time current price. Gate.io lists 4,600+ coins, so coverage of smaller/newer tokens (HYPE, MORPHO, AERO, PENDLE, ONDO) is solid.
 
-Sentiment logic: no AI/LLM calls — this is deterministic, rule-based logic. % change and RSI get bucketed into strong bullish through strong bearish, and a pool of template phrasings is picked per bucket so wording varies run to run without needing an API call.
+"Live" candle handling: the most recent candle in any Gate.io response is still actively forming (the current, in-progress period). The bot drops that one before computing % change / RSI / etc., so all technical analysis is based on fully closed candles — the live ticker price is used separately just for the displayed current price.
 
-Support/resistance: approximated from the swing high/low of the last 30 closed 4H candles (about 5 days). This uses closing prices, not true intraday wicks, so treat it as a solid approximation rather than exact technical S/R.
+Sentiment logic: no AI/LLM calls — this is deterministic, rule-based logic. % change on each timeframe gets bucketed into Bullish/Neutral/Bearish, and the confluence note simply checks whether Daily and Weekly agree.
 
-Reliability: coins are fetched with an 8-second stagger between each and up to 5 retries with 20-second backoff, to stay under CoinGecko's free-tier rate limits. Occasional single-coin skips can still happen on a busy run — the bot logs those honestly rather than guessing.
+Support/resistance: approximated from the swing high/low of the last 30 closed daily candles (~1 month). Real candle data (not approximated from price points), but still a practical window rather than reaching back to all-time extremes.
 
-Setup (if you're forking or rebuilding this)
-Create a Telegram bot: message @BotFather, send /newbot, follow the prompts, save the bot token it gives you.
-Create a Telegram channel (recommended) or get your personal chat ID:
-For a public channel: create a new Channel in Telegram, make it public, pick a handle, add your bot as an admin with "Post Messages" permission. Your TELEGRAM_CHAT_ID is the channel handle, e.g. @YourChannelName.
-For posting to yourself instead: message your bot directly, then visit https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates — your chat ID is the number under "chat":{"id": ...}.
-Fork or clone this repo, then add secrets in Settings, Secrets and variables, Actions, New repository secret:
-TELEGRAM_BOT_TOKEN — your bot token
-TELEGRAM_CHAT_ID — your channel handle or chat ID
-Test it: go to Actions, 4H Signal, Run workflow (use "Run workflow", not "Re-run all jobs" — the latter replays an old commit instead of your current code). Check Telegram after 1-2 minutes. It'll now run automatically every 4 hours from then on.
+TVL: pulled from DefiLlama's /protocols endpoint once per run (not once per coin), matched by protocol name. Base-layer tokens (ETH, HYPE, LINK) don't have a "protocol TVL" in the DeFi sense, so they simply don't show a TVL line.
+
+Self-cleaning channel: the bot remembers the message ID of its last post (in last_message.json, committed back to the repo by the GitHub Actions workflow after each run) and deletes that message before posting the new one, so the channel always shows a single, current post rather than an accumulating feed.
+
+Reliability: each Gate.io/DefiLlama call retries up to 5 times with backoff on transient errors, and coins are fetched with an 8-second stagger between each so a single flaky moment doesn't take down the whole run. If a coin's data can't be fetched, that coin is skipped for that run only — the rest of the message still posts.
+
+Setup (if you're forking/rebuilding this)
+1. Create a Telegram bot
+Message @BotFather on Telegram
+Send /newbot, follow the prompts
+Save the bot token it gives you
+2. Create a Telegram channel and grant admin rights
+Create a new Channel in Telegram, make it public, pick a handle
+Add your bot as an admin with both "Post Messages" and "Delete Messages" permission — the bot needs delete rights to keep the channel to a single live post
+Your TELEGRAM_CHAT_ID is the channel handle, e.g. @YourChannelName
+3. Fork/clone this repo, then add secrets
+
+In your repo: Settings → Secrets and variables → Actions → New repository secret
+
+TELEGRAM_BOT_TOKEN → your bot token
+TELEGRAM_CHAT_ID → your channel handle
+
+No API key is needed for Gate.io or DefiLlama — both are called anonymously.
+
+4. Grant the workflow write permission
+
+The workflow needs contents: write permission (already set in daily-sentiment.yml) so it can commit the updated last_message.json back to the repo after each run.
+
+5. Test it
+
+Go to Actions → Daily Crypto Sentiment Draft → Run workflow (use "Run workflow", not "Re-run all jobs" — the latter replays an old commit instead of your current code). Check Telegram after a minute or two.
+
+Run it a second time afterward to confirm the delete-then-repost cycle works — the first run has no previous post to delete yet.
+
+It'll now run automatically once a day from then on.
+
 Customizing
-
-Coins: edit the COINS list at the top of bot.py. Each entry needs a valid CoinGecko API id, found on the coin's CoinGecko page.
-Schedule: edit the cron line in .github/workflows/daily-sentiment.yml (always UTC).
-Sentiment thresholds or wording: edit trend_bucket(), rsi_bucket(), TREND_TEMPLATES, and RSI_NOTES in bot.py.
-Support/resistance lookback window: change the lookback default in support_resistance_note().
-
+Coins: edit the COINS list at the top of bot.py — just add the ticker (must have a TICKER_USDT pair on Gate.io)
+Schedule: edit the cron line in .github/workflows/daily-sentiment.yml (always UTC)
+Sentiment thresholds / wording: edit trend_bucket(), RSI_NOTES, and confluence_note() in bot.py
+Support/resistance lookback window: change the lookback default in support_resistance_note()
+TVL protocol mapping: edit the DEFILLAMA_NAMES dict if you add a coin that's a genuine DeFi protocol
 Disclaimer
 
-This is not financial advice. The sentiment logic is simple, rule-based technical analysis (price change, RSI, a moving average, volume, and swing high/low) — not a trading signal, not a recommendation, and not a substitute for your own research.
+This is not financial advice. The sentiment logic is simple, rule-based technical analysis (price change across three timeframes, RSI, volume, swing high/low, and TVL) — not a trading signal, not a recommendation, and not a substitute for your own research.
