@@ -28,13 +28,12 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
         run: python bot.py
 
-      - name: Save last message ID
+      - name: Save bot state
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add last_message.json
-          git diff --staged --quiet || git commit -m "Update last message ID [skip ci]"
+          git add last_message.json predictions.json
+          git diff --staged --quiet || git commit -m "Update bot state [skip ci]"
           git push
