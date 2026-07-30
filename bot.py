@@ -45,7 +45,9 @@ DEFILLAMA_NAMES = {
 
 GATE_CANDLES_URL = "https://api.gateio.ws/api/v4/spot/candlesticks"
 GATE_TICKER_URL = "https://api.gateio.ws/api/v4/spot/tickers"
+GATE_FUTURES_CONTRACT_URL = "https://api.gateio.ws/api/v4/futures/usdt/contracts/{contract}"
 DEFILLAMA_PROTOCOLS_URL = "https://api.llama.fi/protocols"
+STABLECOIN_CHART_URL = "https://stablecoins.llama.fi/stablecoincharts/all"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; sentiment-bot/1.0)"}
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -56,6 +58,11 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 # single always-current post. This file gets committed back to the repo by
 # the GitHub Actions workflow after each run.
 STATE_FILE = "last_message.json"
+
+# Tracks each day's sentiment call per coin and whether it was directionally
+# right 24h later — powers the accuracy summary. Also committed back to the
+# repo by the workflow.
+PREDICTIONS_FILE = "predictions.json"
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +153,61 @@ def fetch_timeframes(ticker: str):
         "closes_weekly": closes_weekly, "volumes_weekly": volumes_weekly,
         "live_price": live_price,
     }
+
+
+def fetch_funding_rate(ticker: str, retries: int = 3):
+    """
+    Fetch the current perpetual futures funding rate for this ticker from
+    Gate.io. Returns None gracefully if the coin has no USDT perpetual
+    listed (not all altcoins do) — this is expected for some coins, not an error.
+    """
+    url = GATE_FUTURES_CONTRACT_URL.format(contract=f"{ticker}_USDT")
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            if resp.status_code == 404:
+                return None  # no perpetual market for this coin, not a real error
+            resp.raise_for_status()
+            data = resp.json()
+            rate = data.get("funding_rate")
+            return float(rate) if rate is not None else None
+        except Exception as e:
+            print(f"Funding rate fetch failed for {ticker} (attempt {attempt + 1}): {e}", file=sys.stderr)
+            if attempt < retries - 1:
+                time.sleep(5)
+    return None
+
+
+def fetch_stablecoin_trend(retries: int = 3):
+    """
+    Day-over-day % change in total stablecoin supply across all chains, from
+    DefiLlama. Rising supply = capital parking in stablecoins (risk-off);
+    falling supply = capital deploying into risk assets (risk-on). Returns
+    (pct_change, total_usd) or None if the fetch fails.
+    """
+    for attempt in range(retries):
+        try:
+            resp = requests.get(STABLECOIN_CHART_URL, headers=HEADERS, timeout=25)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data or len(data) < 2:
+                return None
+
+            def total_usd(entry):
+                usd_map = entry.get("totalCirculatingUSD", {})
+                return sum(v for v in usd_map.values() if isinstance(v, (int, float)))
+
+            latest = total_usd(data[-1])
+            prev = total_usd(data[-2])
+            if prev <= 0:
+                return None
+            pct = (latest - prev) / prev * 100
+            return pct, latest
+        except Exception as e:
+            print(f"Stablecoin trend fetch failed (attempt {attempt + 1}): {e}", file=sys.stderr)
+            if attempt < retries - 1:
+                time.sleep(10)
+    return None
 
 
 def fetch_tvl_index(retries: int = 3):
@@ -323,6 +385,88 @@ def tvl_note(protocol):
     return f"<b>TVL ${tvl_str}</b>, {direction} <b>{abs(change_1d):.1f}%</b> over 24h."
 
 
+def funding_rate_note(rate):
+    """rate is a raw funding rate fraction (e.g. 0.0001 = 0.01%), or None if unavailable."""
+    if rate is None:
+        return None
+    pct = rate * 100
+    if abs(pct) < 0.01:
+        return f"Funding rate: <b>{pct:+.3f}%</b> — balanced, no crowding either way."
+    elif pct > 0:
+        return f"Funding rate: <b>{pct:+.3f}%</b> — longs paying shorts, crowded long."
+    else:
+        return f"Funding rate: <b>{pct:+.3f}%</b> — shorts paying longs, crowded short."
+
+
+def returns_series(closes):
+    return [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes))]
+
+
+def pearson_correlation(x, y):
+    n = len(x)
+    if n < 2 or n != len(y):
+        return None
+    mean_x = sum(x) / n
+    mean_y = sum(y) / n
+    cov = sum((x[i] - mean_x) * (y[i] - mean_y) for i in range(n))
+    std_x = (sum((xi - mean_x) ** 2 for xi in x)) ** 0.5
+    std_y = (sum((yi - mean_y) ** 2 for yi in y)) ** 0.5
+    if std_x == 0 or std_y == 0:
+        return None
+    return cov / (std_x * std_y)
+
+
+def correlation_note(alt_closes_daily, btc_closes_daily, window=30):
+    """
+    Rolling correlation between this coin's daily returns and BTC's daily
+    returns over the last `window` days. Uses returns (% changes), not raw
+    price levels, since price levels are trivially correlated for almost
+    any two assets sharing a broad market trend.
+    """
+    if not btc_closes_daily:
+        return None
+    n = min(len(alt_closes_daily), len(btc_closes_daily), window + 1)
+    if n < 11:
+        return None
+    alt_window = alt_closes_daily[-n:]
+    btc_window = btc_closes_daily[-n:]
+    corr = pearson_correlation(returns_series(alt_window), returns_series(btc_window))
+    if corr is None:
+        return None
+    if corr >= 0.7:
+        desc = "strongly correlated with BTC"
+    elif corr >= 0.3:
+        desc = "moderately correlated with BTC"
+    elif corr <= -0.3:
+        desc = "moving inversely to BTC"
+    else:
+        desc = "largely decoupled from BTC"
+    return f"BTC correlation ({window}d): <b>{corr:+.2f}</b> — {desc}."
+
+
+def biggest_mover_note(movers):
+    """movers: list of (ticker, daily_pct_change) tuples."""
+    if not movers:
+        return None
+    ticker, pct = max(movers, key=lambda m: abs(m[1]))
+    direction = "📈" if pct >= 0 else "📉"
+    return f"{direction} Biggest mover today: <b>${ticker} {pct:+.1f}%</b> (daily)"
+
+
+def stablecoin_risk_note(result):
+    """result: (pct_change, total_usd) from fetch_stablecoin_trend(), or None."""
+    if result is None:
+        return None
+    pct, total = result
+    total_str = format_tvl(total)
+    if pct <= -0.3:
+        return f"🟢 Risk-on: stablecoin supply down <b>{abs(pct):.2f}%</b> (total ${total_str}) — capital moving into risk assets."
+    elif pct >= 0.3:
+        return f"🔴 Risk-off: stablecoin supply up <b>{pct:.2f}%</b> (total ${total_str}) — capital parking in stablecoins."
+    else:
+        return f"⚪ Stablecoin supply roughly flat (total ${total_str}) — no clear market-wide risk shift."
+
+
 # ---------------------------------------------------------------------------
 # TEMPLATES + EMOJI
 # ---------------------------------------------------------------------------
@@ -343,7 +487,7 @@ def overall_emoji(daily_label, weekly_label, h4_label):
     return TREND_EMOJI[winner]
 
 
-def build_message(ticker, tf, daily_rsi, protocol):
+def build_message(ticker, tf, daily_rsi, protocol, funding_rate=None, btc_closes_daily=None):
     pct_4h = pct_change(tf["closes_4h"])
     pct_daily = pct_change(tf["closes_daily"])
     pct_weekly = pct_change(tf["closes_weekly"])
@@ -371,40 +515,133 @@ def build_message(ticker, tf, daily_rsi, protocol):
     if rsi_line:
         rsi_line = f"<b>RSI</b> (Daily) <b>{rsi_display}</b> — {rsi_line[4:] if rsi_line.startswith('RSI ') else rsi_line}"
 
+    funding_line = funding_rate_note(funding_rate)
     vol_note = volume_note(tf["volumes_daily"], label="daily")
+    corr_note = correlation_note(tf["closes_daily"], btc_closes_daily) if btc_closes_daily else None
     sr_note = support_resistance_note(tf["closes_daily"], lookback=30, label="daily")
     tvl_line = tvl_note(protocol)
 
-    parts = [title_line, price_line, line_4h, line_daily, line_weekly, conf_note, rsi_line, vol_note, sr_note, tvl_line]
+    parts = [
+        title_line, price_line, line_4h, line_daily, line_weekly,
+        conf_note, rsi_line, funding_line, vol_note, corr_note, sr_note, tvl_line,
+    ]
     return "\n".join(p for p in parts if p)
 
 
 # ---------------------------------------------------------------------------
 # STATE — remember the last posted message so we can delete it next run
 # ---------------------------------------------------------------------------
-def load_last_message_id():
+def load_last_message_ids():
+    """Returns a list of previous message IDs (possibly empty). Handles the
+    old single-message_id format too, for a smooth transition."""
     if not os.path.exists(STATE_FILE):
-        return None
+        return []
     try:
         with open(STATE_FILE) as f:
             data = json.load(f)
-        return data.get("message_id")
+        if "message_ids" in data:
+            return data["message_ids"]
+        if data.get("message_id"):  # old single-ID format
+            return [data["message_id"]]
+        return []
     except Exception as e:
         print(f"Couldn't read state file, treating as no previous message: {e}", file=sys.stderr)
-        return None
+        return []
 
 
-def save_last_message_id(message_id):
+def save_last_message_ids(message_ids):
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump({"message_id": message_id}, f)
+            json.dump({"message_ids": message_ids}, f)
     except Exception as e:
         print(f"Couldn't write state file: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
+# ACCURACY TRACKING — remember each day's Daily-timeframe call per coin, then
+# check 24h later (i.e. the next run) whether it was directionally right
+# ---------------------------------------------------------------------------
+def load_predictions_state():
+    if not os.path.exists(PREDICTIONS_FILE):
+        return {"pending": {}, "history": []}
+    try:
+        with open(PREDICTIONS_FILE) as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Couldn't read predictions state, starting fresh: {e}", file=sys.stderr)
+        return {"pending": {}, "history": []}
+
+
+def save_predictions_state(state):
+    try:
+        with open(PREDICTIONS_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"Couldn't write predictions state: {e}", file=sys.stderr)
+
+
+def evaluate_and_record_prediction(state, ticker, today_str, new_predicted_label, live_price):
+    """
+    If there's a pending prediction for this ticker from a previous run,
+    checks whether it was directionally correct (comparing today's price to
+    the price at prediction time), records it to history, then stores
+    today's fresh prediction as the new pending entry.
+    """
+    pending = state["pending"].get(ticker)
+    if pending and pending.get("date") != today_str:
+        old_price = pending.get("price")
+        old_predicted = pending.get("predicted_label")
+        if old_price and old_predicted:
+            try:
+                actual_pct = (live_price - old_price) / old_price * 100
+                actual_label = label_for(trend_bucket(actual_pct))
+                correct = actual_label == old_predicted
+                state["history"].append({
+                    "date": pending["date"], "ticker": ticker,
+                    "predicted": old_predicted, "actual": actual_label, "correct": correct,
+                })
+                state["history"] = state["history"][-1000:]  # keep it bounded
+            except Exception as e:
+                print(f"Prediction eval error for {ticker}: {e}", file=sys.stderr)
+
+    state["pending"][ticker] = {"date": today_str, "predicted_label": new_predicted_label, "price": live_price}
+
+
+def accuracy_summary_note(state, days=7):
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+    recent = [h for h in state["history"] if h["date"] >= cutoff]
+    if not recent:
+        return None
+    correct = sum(1 for h in recent if h["correct"])
+    total = len(recent)
+    pct = correct / total * 100
+    return f"📊 <b>Accuracy (last {days}d):</b> {correct}/{total} calls correct ({pct:.0f}%)"
+
+
+# ---------------------------------------------------------------------------
 # TELEGRAM DELIVERY
 # ---------------------------------------------------------------------------
+def chunk_message(full_text: str, limit: int = 4000):
+    """
+    Splits the full digest into Telegram-safe chunks (under the 4096 char
+    limit, with some margin). Splits only at blank-line section boundaries,
+    so a single coin's block is never cut in half.
+    """
+    sections = full_text.split("\n\n")
+    chunks = []
+    current = ""
+    for section in sections:
+        candidate = f"{current}\n\n{section}" if current else section
+        if len(candidate) > limit and current:
+            chunks.append(current)
+            current = section
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def delete_telegram_message(message_id):
     """
     Deletes the previous post so the channel only ever shows one live post.
@@ -443,14 +680,51 @@ def send_telegram_message(text: str):
     return result.get("result", {}).get("message_id")
 
 
+def send_telegram_messages(full_text: str):
+    """
+    Splits the digest into Telegram-safe chunks (if needed) and sends each
+    as its own message. Returns the list of message_ids actually sent (so
+    they can all be deleted before next run's post).
+    """
+    chunks = chunk_message(full_text)
+    message_ids = []
+    for chunk in chunks:
+        mid = send_telegram_message(chunk)
+        if mid:
+            message_ids.append(mid)
+        time.sleep(1)  # brief pause between multi-part sends
+    return message_ids
+
+
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 def main():
-    today = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"📊 Daily Signal — {today}", ""]
+    now = datetime.datetime.utcnow()
+    today_display = now.strftime("%Y-%m-%d %H:%M UTC")
+    today_str = now.strftime("%Y-%m-%d")
+
+    lines = [f"📊 Daily Signal — {today_display}", ""]
+
+    # Market-wide context, shown once up top
+    stable_result = fetch_stablecoin_trend()
+    risk_note = stablecoin_risk_note(stable_result)
+    if risk_note:
+        lines.append(risk_note)
+        lines.append("")
 
     tvl_index = fetch_tvl_index()
+
+    # BTC daily closes, fetched once and reused for every coin's correlation note
+    btc_closes_daily = None
+    try:
+        btc_candles = fetch_gate_candles("BTC", "1d", limit=40)
+        btc_closes_daily = [c["close"] for c in btc_candles[:-1]]
+    except Exception as e:
+        print(f"BTC fetch for correlation failed (non-fatal, correlation notes will be skipped): {e}", file=sys.stderr)
+
+    pred_state = load_predictions_state()
+    movers = []
 
     for i, ticker in enumerate(COINS):
         if i > 0:
@@ -458,26 +732,44 @@ def main():
         try:
             tf = fetch_timeframes(ticker)
             daily_rsi = compute_rsi(tf["closes_daily"])
+            pct_daily = pct_change(tf["closes_daily"])
+            movers.append((ticker, pct_daily))
+
             protocol = None
             if ticker in DEFILLAMA_NAMES:
                 protocol = find_protocol(tvl_index, DEFILLAMA_NAMES[ticker])
-            message = build_message(ticker, tf, daily_rsi, protocol)
+
+            funding_rate = fetch_funding_rate(ticker)
+
+            message = build_message(ticker, tf, daily_rsi, protocol, funding_rate, btc_closes_daily)
             lines.append(message)
             lines.append("")
+
+            label_daily = label_for(trend_bucket(pct_daily))
+            evaluate_and_record_prediction(pred_state, ticker, today_str, label_daily, tf["live_price"])
         except Exception as e:
             print(f"Error processing {ticker}: {e}", file=sys.stderr)
             lines.append(f"— ${ticker} —")
             lines.append("⚠️ Couldn't fetch data this run, skipped.")
             lines.append("")
 
+    # Footer: biggest mover + rolling accuracy
+    footer_parts = [biggest_mover_note(movers), accuracy_summary_note(pred_state, days=7)]
+    footer = "\n".join(p for p in footer_parts if p)
+    if footer:
+        lines.append(footer)
+
     full_message = "\n".join(lines).strip()
 
-    last_id = load_last_message_id()
-    delete_telegram_message(last_id)
+    last_ids = load_last_message_ids()
+    for mid in last_ids:
+        delete_telegram_message(mid)
 
-    new_id = send_telegram_message(full_message)
-    if new_id:
-        save_last_message_id(new_id)
+    new_ids = send_telegram_messages(full_message)
+    if new_ids:
+        save_last_message_ids(new_ids)
+
+    save_predictions_state(pred_state)
 
     print("Done.")
 
